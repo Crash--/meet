@@ -2,6 +2,10 @@
 
 # pylint: disable=abstract-method
 
+import base64
+import hashlib
+import json
+
 from django.conf import settings
 
 from pydantic import ValidationError
@@ -26,21 +30,50 @@ class LivekitTokenSerializer(BaseValidationOnlySerializer):
     """What an application asks for a LiveKit token of the delegated user.
 
     `identity` is imposed by the caller: a MatrixRTC client derives it on every
-    device (`@user:server:device`), so Meet must mint exactly that one. That
-    shape is never the `sub` of a user (a `sub` holds no colon): the token
-    cannot enter the room as somebody else's Meet identity. `sub`
+    device, so Meet must mint exactly that one. It is `@user:server:device`
+    (legacy call memberships), which is never the `sub` of a user (a `sub`
+    holds no colon), or the hash of MSC4195,
+    `Base64(SHA256(Canonicalize([sender, member.id])))` unpadded. A hash names
+    nobody, so `matrix_user_id` and `matrix_member_id` come with it, and Meet
+    takes the hash only when it is theirs: any other 43 characters could be
+    the `sub` of a user. `sub`
     fills the OIDC subject of a user provisioned by email, which the deliveries
     need.
     """
 
     identity = serializers.RegexField(
-        regex=r"^@[^:\s]+:[^\s]+:[^:\s]+$", max_length=255
+        regex=r"^(?:@[^:\s]+:[^\s]+:[^:\s]+|[A-Za-z0-9+/]{43})$", max_length=255
     )
+    matrix_user_id = serializers.RegexField(
+        regex=r"^@[^:\s]+:[^\s]+$", max_length=255, required=False
+    )
+    matrix_member_id = serializers.CharField(max_length=255, required=False)
     username = serializers.CharField(max_length=255, required=False)
     role = serializers.ChoiceField(
         choices=models.RoleChoices.choices, required=False, allow_null=True
     )
     sub = serializers.CharField(max_length=255, required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        """A hashed identity is the hash of its two Matrix ids."""
+        if attrs["identity"].startswith("@"):
+            return attrs
+        user_id = attrs.get("matrix_user_id")
+        member_id = attrs.get("matrix_member_id")
+        if not (user_id and member_id):
+            raise serializers.ValidationError(
+                "A hashed identity needs matrix_user_id and matrix_member_id."
+            )
+        # Canonical JSON (Matrix) of an array of two strings
+        canonical = json.dumps(
+            [user_id, member_id], ensure_ascii=False, separators=(",", ":")
+        )
+        digest = hashlib.sha256(canonical.encode()).digest()
+        if attrs["identity"] != base64.b64encode(digest).decode().rstrip("="):
+            raise serializers.ValidationError(
+                "The identity is not the hash of matrix_user_id and matrix_member_id."
+            )
+        return attrs
 
 
 class RoomSerializer(serializers.ModelSerializer):

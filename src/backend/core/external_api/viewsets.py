@@ -207,9 +207,9 @@ class RoomViewSet(
     )
     def livekit_token(self, request, pk=None):  # pylint: disable=unused-argument
         """Mint a LiveKit token for the delegated user, with the identity the
-        application imposes (`@user:server:device`, as a MatrixRTC client
-        derives it). Meet then knows the participant: recording, transcription
-        and the raised hands follow its rules."""
+        application imposes (`@user:server:device`, or the hash of MSC4195, as
+        a MatrixRTC client derives it). Meet then knows the participant:
+        recording, transcription and the raised hands follow its rules."""
         serializer = serializers.LivekitTokenSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -245,7 +245,17 @@ class RoomViewSet(
                 )
 
         identity = data["identity"]
-        matrix_user_id, _, matrix_device_id = identity.rpartition(":")
+        if identity.startswith("@"):
+            matrix_user_id, _, matrix_device_id = identity.rpartition(":")
+            matrix_attributes = {
+                "matrix_user_id": matrix_user_id,
+                "matrix_device_id": matrix_device_id,
+            }
+        else:
+            matrix_attributes = {
+                "matrix_user_id": data["matrix_user_id"],
+                "matrix_member_id": data["matrix_member_id"],
+            }
         role = data.get("role")
         livekit_config = utils.generate_livekit_config(
             room_id=str(room.id),
@@ -254,10 +264,7 @@ class RoomViewSet(
             role=role,
             configuration=room.configuration,
             identity=identity,
-            extra_attributes={
-                "matrix_user_id": matrix_user_id,
-                "matrix_device_id": matrix_device_id,
-            },
+            extra_attributes=matrix_attributes,
             ttl=timedelta(seconds=settings.APPLICATION_LIVEKIT_TOKEN_TTL_SECONDS),
         )
 

@@ -4,6 +4,9 @@ Tests for external API /rooms/{id}/livekit-token endpoint
 
 # pylint: disable=W0621
 
+import base64
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -113,6 +116,66 @@ def test_livekit_token_uses_the_identity_the_application_imposes(settings):
     assert claims["attributes"]["matrix_user_id"] == "@alice:localhost"
     assert claims["attributes"]["matrix_device_id"] == "DEVICE"
     assert claims["attributes"]["room_role"] == "administrator"
+
+
+def msc4195_identity(user_id, member_id):
+    """`Base64(SHA256(Canonicalize([sender, member.id])))`, unpadded, as MSC4195 derives it."""
+    canonical = json.dumps(
+        [user_id, member_id], ensure_ascii=False, separators=(",", ":")
+    )
+    digest = hashlib.sha256(canonical.encode()).digest()
+    return base64.b64encode(digest).decode().rstrip("=")
+
+
+def test_livekit_token_takes_the_hashed_identity_of_msc4195():
+    """The identity of the merged MatrixRTC contract cannot be split: the Matrix
+    ids come in their own fields and go to the attributes."""
+    room = room_of_the_application()
+    alice = UserFactory()
+    identity = msc4195_identity("@alice:localhost", "member-1")
+
+    response = mint(
+        alice,
+        room,
+        {
+            "identity": identity,
+            "matrix_user_id": "@alice:localhost",
+            "matrix_member_id": "member-1",
+        },
+    )
+
+    assert response.status_code == 200
+    claims = decode(response.json()["token"])
+    assert claims["sub"] == identity
+    assert claims["attributes"]["user_id_proof"] == user_id_proof(
+        str(room.id), identity, str(alice.pk)
+    )
+    assert claims["attributes"]["matrix_user_id"] == "@alice:localhost"
+    assert claims["attributes"]["matrix_member_id"] == "member-1"
+    assert "matrix_device_id" not in claims["attributes"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"matrix_member_id": "member-1"},
+        {"matrix_user_id": "@alice:localhost"},
+        {"matrix_user_id": "alice", "matrix_member_id": "member-1"},
+        {"matrix_user_id": "@alice:localhost", "matrix_member_id": ""},
+        {"matrix_user_id": "@bob:localhost", "matrix_member_id": "member-1"},
+        {"matrix_user_id": "@alice:localhost", "matrix_member_id": "member-2"},
+    ],
+)
+def test_livekit_token_needs_the_matrix_ids_of_a_hashed_identity(body):
+    """A hashed identity names nobody: without the two Matrix ids it is the
+    hash of, 400."""
+    room = room_of_the_application()
+    alice = UserFactory()
+    identity = msc4195_identity("@alice:localhost", "member-1")
+
+    response = mint(alice, room, {"identity": identity, **body})
+
+    assert response.status_code == 400
 
 
 def test_livekit_token_needs_no_role_on_the_room():
@@ -238,14 +301,31 @@ def test_livekit_token_refuses_an_addons_token():
 
 @pytest.mark.parametrize(
     "identity",
-    ["", "alice", "@alice:localhost", "alice:localhost:DEVICE", "@alice:local host:A"],
+    [
+        "",
+        "alice",
+        "@alice:localhost",
+        "alice:localhost:DEVICE",
+        "@alice:local host:A",
+        "A" * 42,
+        "A" * 43 + "=",
+        "A" * 42 + "-",
+    ],
 )
 def test_livekit_token_refuses_an_identity_of_another_shape(identity):
-    """The identity is `@user:server:device`, nothing else."""
+    """The identity is `@user:server:device` or the hash of MSC4195, nothing else."""
     room = room_of_the_application()
     alice = UserFactory()
 
-    response = mint(alice, room, {"identity": identity})
+    response = mint(
+        alice,
+        room,
+        {
+            "identity": identity,
+            "matrix_user_id": "@alice:localhost",
+            "matrix_member_id": "member-1",
+        },
+    )
 
     assert response.status_code == 400
 
