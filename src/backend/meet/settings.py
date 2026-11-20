@@ -784,6 +784,12 @@ class Base(Configuration):
         environ_name="OIDC_RS_CORE_API_ALLOWED_AUDIENCES",
         environ_prefix=None,
     )
+    # An access token of an unknown sub signs in to the user an application
+    # provisioned with the email of its userinfo, rather than a second account,
+    # when userinfo says that email is verified (email_verified).
+    OIDC_RS_LINK_USERS_BY_EMAIL = values.BooleanValue(
+        default=False, environ_name="OIDC_RS_LINK_USERS_BY_EMAIL", environ_prefix=None
+    )
 
     # Menshen, La Suite's OAuth 2.0 token exchange server
     MENSHEN_ENABLED = values.BooleanValue(
@@ -2016,6 +2022,15 @@ class Base(Configuration):
                 "OIDC_RS_CORE_API_ENABLED is set but OIDC_RS_CLIENT_SECRET, "
                 "OIDC_OP_URL or OIDC_OP_INTROSPECTION_ENDPOINT is missing: no access "
                 "token will be accepted on the core API.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if cls.OIDC_RS_CORE_API_ENABLED and not cls.OIDC_OP_USER_ENDPOINT:
+            warnings.warn(
+                "OIDC_RS_CORE_API_ENABLED is set but OIDC_OP_USER_ENDPOINT is "
+                "missing: an access token of a user Meet does not know yet will be "
+                "refused.",
                 UserWarning,
                 stacklevel=2,
             )

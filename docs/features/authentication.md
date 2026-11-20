@@ -71,6 +71,7 @@ This is **off by default**.
 |------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
 | OIDC_RS_CORE_API_ENABLED           | Accept OIDC access tokens on the core API                                                                                                                                         | `false` |
 | OIDC_RS_CORE_API_ALLOWED_AUDIENCES | Client ids whose tokens are accepted, read from the `OIDC_RS_AUDIENCE_CLAIM` of the introspection response (`client_id` by default). Checked before any user is looked up or created. Empty: no token is accepted. Applies to the external API too while `OIDC_RS_CORE_API_ENABLED` is set: list there every client that uses it | `[]`    |
+| OIDC_RS_LINK_USERS_BY_EMAIL        | If a user has the email of userinfo and no `sub` (provisioned by an application), the first token of an unknown `sub` signs in to that user, who keeps the `sub`. Only when userinfo says `email_verified: true`: a false or absent claim links nothing. Applies to the external API's resource server too | `false` |
 
 It reuses the resource server settings, which must all be set:
 
@@ -80,6 +81,13 @@ It reuses the resource server settings, which must all be set:
 | OIDC_OP_URL                    | The provider's issuer, **exactly** as in its discovery document: an introspection response whose `iss` differs is refused               |
 | OIDC_RS_CLIENT_ID / _SECRET    | The credentials Meet introspects with, usually its own client (`OIDC_RP_CLIENT_ID`). The provider must let it introspect the app's tokens |
 | OIDC_RS_SCOPES                 | At least one scope the app requests, e.g. `openid`                                                                                      |
+| OIDC_OP_USER_ENDPOINT          | The provider's userinfo endpoint, called with the app's token: without it, a user Meet does not know yet is refused                      |
+
+The provider's client of the app must export the claims the web sign-in reads
+(`email`, the `OIDC_USERINFO_FULLNAME_FIELDS` and `OIDC_USERINFO_SHORTNAME_FIELD`
+names, the `OIDC_USERINFO_TWAKE_INSTANCE_FIELD` instance, `workplaceFqdn` by
+default) and, for `OIDC_RS_LINK_USERS_BY_EMAIL`, `email_verified`. On
+LemonLDAP::NG, `email_verified` is sent only when the client exports it.
 
 Example, for an app registered as `twake-visio` on a LemonLDAP::NG provider:
 
@@ -88,6 +96,7 @@ OIDC_RS_CORE_API_ENABLED=True
 OIDC_RS_CORE_API_ALLOWED_AUDIENCES=twake-visio
 OIDC_OP_URL=https://sso.example.com
 OIDC_OP_INTROSPECTION_ENDPOINT=https://sso.example.com/oauth2/introspect
+OIDC_OP_USER_ENDPOINT=https://sso.example.com/oauth2/userinfo
 OIDC_RS_CLIENT_ID=meet
 OIDC_RS_CLIENT_SECRET=<the secret of the meet client>
 OIDC_RS_SCOPES=openid
@@ -101,9 +110,13 @@ Behaviour worth knowing:
   expired token, so that the app refreshes it.
 * Each such request costs one introspection call to the provider; responses
   are not cached.
-* With `OIDC_CREATE_USER`, a user who first signs in from the app is created
-  from the `sub` alone, as with the external API: email and names arrive at
-  their first sign-in on the web app.
+* A `sub` Meet does not know yet costs one call to userinfo, then signs in as
+  the web does: with `OIDC_CREATE_USER`, the user is created with the email,
+  names and Twake instance of userinfo, and the sign-in hooks run (entitlements
+  cache). If userinfo fails, the request answers `401` and nobody is created.
+* A known user is refreshed from userinfo at the first request of each access
+  token, as the web refreshes it at each sign-in. A failed refresh is logged
+  and the request is still served.
 * The app must get the same `sub` as the web client, or the same person gets
   two accounts: check that both clients use the same user attribute on the
   provider.

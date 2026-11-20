@@ -10,12 +10,19 @@ Code + PKCE, public client) as a Bearer header; Meet introspects it.
 from unittest import mock
 from urllib.parse import parse_qs
 
+from django.core.cache import cache
+from django.db.models import QuerySet
+
 import pytest
 import responses
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from rest_framework.test import APIClient
 
 from core import utils
+from core.external_api.authentication import (
+    _link_provisional_user,
+    userinfo_cache_key,
+)
 from core.factories import RoomFactory, UserFactory
 from core.models import Recording, Room, User
 
@@ -100,8 +107,9 @@ def test_allowed_token_authenticates_its_user(resource_server):
 
     assert response.status_code == 200
     assert response.json()["id"] == str(user.id)
-    assert len(responses.calls) == 1
-    sent = parse_qs(responses.calls[0].request.body)
+    introspections = [c for c in responses.calls if c.request.url == INTROSPECTION_URL]
+    assert len(introspections) == 1
+    sent = parse_qs(introspections[0].request.body)
     assert sent == {
         "client_id": ["meet"],
         "client_secret": ["meet-secret"],
@@ -109,28 +117,256 @@ def test_allowed_token_authenticates_its_user(resource_server):
     }
 
 
-@responses.activate
-def test_allowed_token_creates_an_unknown_user(resource_server):
-    """A first sign-in from the app creates the user, as the external API does."""
+USERINFO_URL = f"{OP_URL}/userinfo"
+
+
+@pytest.fixture(autouse=True)
+def no_refreshed_token():
+    """Each test starts with no access token whose userinfo was read. Only these
+    keys: the cache is shared with the tests other workers run meanwhile."""
+    cache.delete_many(
+        [userinfo_cache_key(token) for token in (TOKEN, "next-access-token")]
+    )
+
+
+@pytest.fixture
+def with_userinfo(resource_server):
+    """The provider's userinfo endpoint, as the web sign-in uses it."""
+    resource_server.OIDC_OP_USER_ENDPOINT = USERINFO_URL
     resource_server.OIDC_CREATE_USER = True
-    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("new-sub"))
+    return resource_server
+
+
+def userinfo(sub="alice", **claims):
+    """A userinfo response for the app's token."""
+    claims = {
+        "sub": sub,
+        "email": "alice@example.com",
+        "email_verified": True,
+        "given_name": "Alice",
+        "usual_name": "Martin",
+        "workplaceFqdn": "alice.twake.example.com",
+        **claims,
+    }
+    responses.add(
+        responses.GET,
+        USERINFO_URL,
+        json={key: value for key, value in claims.items() if value is not None},
+    )
+
+
+def userinfo_calls():
+    """The calls Meet made to the userinfo endpoint."""
+    return [c for c in responses.calls if c.request.url == USERINFO_URL]
+
+
+@responses.activate
+def test_allowed_token_creates_a_complete_user(with_userinfo):
+    """A first sign-in from the app creates the user with what the web sign-in
+    stores: email, names and Twake instance from userinfo, asked with the token."""
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("alice"))
+    userinfo()
+
+    with mock.patch("core.authentication.backends.get_user_entitlements") as warm:
+        response = bearer().get("/api/v1.0/users/me/")
+
+    assert response.status_code == 200
+    user = User.objects.get(sub="alice")
+    assert response.json()["id"] == str(user.id)
+    assert user.email == "alice@example.com"
+    assert user.full_name == "Alice Martin"
+    assert user.short_name == "Alice"
+    assert user.twake_instance == "alice.twake.example.com"
+    warm.assert_called_once()
+    assert userinfo_calls()[0].request.headers["Authorization"] == f"Bearer {TOKEN}"
+
+
+@responses.activate
+def test_userinfo_without_twake_instance_creates_the_user(with_userinfo):
+    """A provider that exports no workplaceFqdn leaves the instance empty."""
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("alice"))
+    userinfo(workplaceFqdn=None)
 
     response = bearer().get("/api/v1.0/users/me/")
 
     assert response.status_code == 200
-    assert response.json()["id"] == str(User.objects.get(sub="new-sub").id)
+    user = User.objects.get(sub="alice")
+    assert user.full_name == "Alice Martin"
+    assert user.twake_instance is None
 
 
 @responses.activate
-def test_allowed_token_does_not_create_a_user_when_creation_is_off(resource_server):
+def test_allowed_token_does_not_create_a_user_when_creation_is_off(with_userinfo):
     """OIDC_CREATE_USER=False is honoured: an unknown sub is not authenticated."""
-    resource_server.OIDC_CREATE_USER = False
-    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("new-sub"))
+    with_userinfo.OIDC_CREATE_USER = False
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("alice"))
+    userinfo()
 
     response = bearer().get("/api/v1.0/users/me/")
 
     assert response.status_code == 401
-    assert not User.objects.filter(sub="new-sub").exists()
+    assert not User.objects.filter(sub="alice").exists()
+
+
+@responses.activate
+def test_userinfo_failure_answers_401_and_creates_nobody(with_userinfo):
+    """Without userinfo, no incomplete user is created from the sub alone."""
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("alice"))
+    responses.add(
+        responses.GET, USERINFO_URL, body=RequestsConnectionError("unreachable")
+    )
+
+    response = bearer().get("/api/v1.0/users/me/")
+
+    assert response.status_code == 401
+    assert not User.objects.filter(sub="alice").exists()
+
+
+@responses.activate
+def test_known_user_is_refreshed_once_per_access_token(with_userinfo):
+    """As the web sign-in refreshes the user at each sign-in, a known user is
+    refreshed at the first request of each access token, not at every one."""
+    user = UserFactory(sub="alice", full_name="Old Name")
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("alice"))
+    userinfo()
+
+    for token in (TOKEN, TOKEN, "next-access-token"):
+        assert bearer(token).get("/api/v1.0/users/me/").status_code == 200
+
+    user.refresh_from_db()
+    assert user.full_name == "Alice Martin"
+    assert len(userinfo_calls()) == 2
+
+
+@responses.activate
+def test_known_user_is_served_when_userinfo_fails(with_userinfo):
+    """A failed refresh does not lock a known user out."""
+    user = UserFactory(sub="alice")
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("alice"))
+    responses.add(
+        responses.GET, USERINFO_URL, body=RequestsConnectionError("unreachable")
+    )
+
+    response = bearer().get("/api/v1.0/users/me/")
+
+    assert response.status_code == 200
+    assert response.json()["id"] == str(user.id)
+
+
+# ==============================
+# Users provisioned by email
+# ==============================
+
+
+@pytest.fixture
+def link_by_email(with_userinfo):
+    """Unknown subs are matched by the verified email of their userinfo."""
+    with_userinfo.OIDC_RS_LINK_USERS_BY_EMAIL = True
+    return with_userinfo
+
+
+def provisional_user(email="alice@example.com"):
+    """A user an application provisioned by email, before any sign-in."""
+    return UserFactory(sub=None, email=email)
+
+
+@responses.activate
+def test_unknown_sub_takes_over_the_provisional_user(link_by_email):
+    """The app signs in to the account an application provisioned, which keeps
+    the sub and is completed from userinfo: the next request needs no userinfo."""
+    user = provisional_user()
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("alice"))
+    userinfo(email="Alice@example.com")
+
+    for _ in range(2):
+        response = bearer().get("/api/v1.0/users/me/")
+        assert response.status_code == 200
+        assert response.json()["id"] == str(user.id)
+
+    user.refresh_from_db()
+    assert user.sub == "alice"
+    assert user.full_name == "Alice Martin"
+    assert user.twake_instance == "alice.twake.example.com"
+    assert User.objects.count() == 1
+    assert len(userinfo_calls()) == 1
+
+
+@responses.activate
+def test_provisional_user_is_linked_even_when_creation_is_off(link_by_email):
+    """Linking creates no account: OIDC_CREATE_USER=False does not prevent it."""
+    link_by_email.OIDC_CREATE_USER = False
+    user = provisional_user()
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("alice"))
+    userinfo()
+
+    response = bearer().get("/api/v1.0/users/me/")
+
+    assert response.status_code == 200
+    assert response.json()["id"] == str(user.id)
+
+
+@pytest.mark.parametrize("email_verified", [False, "false", None])
+@responses.activate
+def test_unverified_email_never_takes_over_an_account(link_by_email, email_verified):
+    """An email the provider does not say is verified (false or absent) could be
+    anyone's: the provisional user stays untouched, the sub gets its own."""
+    provisional = provisional_user()
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("attacker"))
+    userinfo(sub="attacker", email_verified=email_verified)
+
+    response = bearer().get("/api/v1.0/users/me/")
+
+    assert response.status_code == 200
+    assert response.json()["id"] != str(provisional.id)
+    provisional.refresh_from_db()
+    assert provisional.sub is None
+
+
+def test_a_provisional_user_is_taken_by_one_sub_only(link_by_email):
+    """Two first tokens of different subs read the provisional user at once:
+    only the first write lands, the second takes nothing."""
+    provisional = provisional_user()
+    stale = User.objects.get(pk=provisional.pk)
+    assert _link_provisional_user("sub-a", "alice@example.com", MOBILE_CLIENT_ID)
+
+    with mock.patch.object(QuerySet, "first", return_value=stale):
+        assert (
+            _link_provisional_user("sub-b", "alice@example.com", MOBILE_CLIENT_ID)
+            is None
+        )
+
+    provisional.refresh_from_db()
+    assert provisional.sub == "sub-a"
+
+
+@responses.activate
+def test_email_of_a_user_with_another_sub_is_refused(link_by_email):
+    """Only a user without sub is taken over; a signed-in user of the email is
+    refused, as the external API does with the email fallback."""
+    link_by_email.OIDC_FALLBACK_TO_EMAIL_FOR_IDENTIFICATION = True
+    UserFactory(sub="alice-on-the-web", email="alice@example.com")
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("alice"))
+    userinfo()
+
+    response = bearer().get("/api/v1.0/users/me/")
+
+    assert response.status_code == 401
+    assert not User.objects.filter(sub="alice").exists()
+
+
+@responses.activate
+def test_provisional_user_is_ignored_when_linking_is_off(with_userinfo):
+    """Off by default: the sub gets an account of its own."""
+    provisional = provisional_user()
+    responses.add(responses.POST, INTROSPECTION_URL, json=introspection("alice"))
+    userinfo()
+
+    response = bearer().get("/api/v1.0/users/me/")
+
+    assert response.status_code == 200
+    assert response.json()["id"] != str(provisional.id)
+    provisional.refresh_from_db()
+    assert provisional.sub is None
 
 
 @responses.activate

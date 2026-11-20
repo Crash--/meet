@@ -24,6 +24,14 @@ It is off by default: nothing changes until `OIDC_RS_CORE_API_ENABLED` is set,
 and then only for the clients listed in `OIDC_RS_CORE_API_ALLOWED_AUDIENCES`.
 See "Native apps" in `docs/features/authentication.md`.
 
+- `OIDC_OP_USER_ENDPOINT` is required: users are completed from userinfo,
+  called with the app's token. The provider's client of the app must export
+  `email`, the name claims and `workplaceFqdn`, as Meet's own client does.
+- With `OIDC_RS_LINK_USERS_BY_EMAIL`, the first token of a person an
+  application provisioned by email signs in to that account. The client must
+  then also export `email_verified`, set only for emails the provider checked:
+  without it, nothing is linked.
+
 ### LinTO fork: the late joiners' brief, from a recording or a live run
 
 A participant who joins late gets "Before you arrived": the side panel opens
