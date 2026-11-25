@@ -16,6 +16,64 @@ the following command inside your docker container:
 
 ## [Unreleased]
 
+### LinTO fork: one Studio conversation per meeting for the late joiners' brief
+
+The late joiners' brief of a transcribed recording now goes through one Studio
+conversation per meeting, open to appended audio, instead of one throwaway
+conversation per brief.
+
+LinTO, on the Studio Meet uses (`LINTO_STUDIO_BASE_URL`), **deploy it first**:
+
+- studio-api with partial conversations (`linto-studio` `next` since #415):
+  the upload accepts `partial=true`, and `POST
+  /api/organizations/{org}/conversations/{id}/append` takes the next audio, or
+  `complete=true` to close the conversation. With an older Studio the first
+  brief works, the next late joiners get an error, and the transcript falls
+  back to a full upload.
+
+Meet pins the `linto` SDK 1.5.0 (partial conversations, publication routes
+scoped as Studio serves them).
+
+
+Meet, when `LINTO_CATCHUP_ENABLED` and `LINTO_STUDIO_ENABLED` are on:
+
+- An audio recording ("Transcribe after the meeting") is recorded by one
+  audio-only egress writing 10 s segments under `LINTO_CATCHUP_PREFIX`
+  (recording option `segments`): no OGG egress, no side egress. The deferred
+  transcription writes the recording's OGG file from the segments (one ffmpeg
+  encode per recording on Celery), then deletes them. Next to a video, the side
+  egress stays.
+- The first late joiner creates the meeting's conversation with the
+  transcript's settings (name `Reunion_<date>`, diarization, speaker
+  identification, `LINTO_STUDIO_MEMBERS_RIGHT`); the next ones append the new
+  minutes to it. Studio lists it as being transcribed during the meeting. At
+  the end it gets the last minutes and is finished: it is the transcript, the
+  meeting is not transcribed a second time. Next to a video it only serves the
+  briefs and is deleted at the end.
+- The brief has no option any more, in both tools: a late joiner always gets
+  it (the "Catch-up summary" checkboxes are gone; the backend ignores a
+  `catchup` sent by an older frontend). It still needs the `summary`
+  capability of the recording's owner or of the live run's starter, and a live
+  run beside a recording (captions only) leaves it to the recording. Deploy
+  the backend and the frontend together.
+- The arrival only plans the brief and answers at once: the next status poll
+  sends the audio to Studio (it holds a backend worker while the audio goes).
+  Past its estimate a step says it runs late instead of a time left; a failed
+  brief says so; the previous brief stays in view while the next one is
+  prepared (new `overdue` key of `rooms/{id}/linto/audio-catchup/`).
+- Each brief is a new summary of the whole conversation (`regenerate=true`),
+  left among the conversation's exports. Meet no longer edits turns nor
+  deletes the conversation after a brief.
+- `LINTO_CATCHUP_DELETE_DELAY_S` is gone. The reconciler deletes the segments
+  of a failed recording, or of one older than two days.
+- The storage polling fallback reads the closed playlist (`#EXT-X-ENDLIST`) of
+  a recording written as segments.
+- The conversation id and the end of the audio sent live in
+  `recording.linto_state["catchup"]`; the Django cache keeps only the brief
+  and the running job.
+- Known limit, on Studio's side: each appended part is diarized alone, its
+  speakers are matched by name with the previous parts'.
+
 ### OIDC access tokens on the core API, for native apps
 
 The core API (`/api/v1.0/`) can now authenticate OIDC access tokens sent as
