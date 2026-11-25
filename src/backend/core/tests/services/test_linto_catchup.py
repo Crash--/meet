@@ -2,11 +2,13 @@
 
 # pylint: disable=W0621,W0212,E1101,W0613,too-many-lines
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from django.core.cache import cache
 
+import aiohttp
 import pytest
 from livekit import api
 
@@ -106,15 +108,15 @@ def test_catchup_prefix_detection():
     ("mode", "options", "eligible"),
     (
         ("transcript", {"catchup": True}, True),
-        ("transcript", {}, False),
-        ("transcript", {"catchup": False}, False),
+        ("transcript", {}, True),
+        ("transcript", {"catchup": False}, True),
         ("screen_recording", {"transcribe": True, "catchup": True}, True),
         ("screen_recording", {"original_mode": "transcript", "catchup": True}, True),
         ("screen_recording", {"catchup": True}, False),
     ),
 )
 def test_is_eligible(mode, options, eligible):
-    """Only transcribed recordings whose starter left the option on."""
+    """Every transcribed recording: the brief has no option any more."""
     recording = RecordingFactory(mode=mode, options=options)
     assert linto_catchup.is_eligible(recording) is eligible
 
@@ -147,12 +149,97 @@ def test_segments_between_keeps_what_is_not_sent_yet():
     assert [s["name"] for s in delta] == [f"seg_{i:05d}.ts" for i in range(4, 9)]
 
 
+def test_segments_between_without_end_takes_the_rest():
+    """At the end of the recording, every segment not sent yet."""
+    with mock.patch.object(linto_catchup, "list_segments", return_value=_segments(10)):
+        rest = linto_catchup.segments_between("r", T0 + timedelta(seconds=40), None)
+    assert [s["name"] for s in rest] == [f"seg_{i:05d}.ts" for i in range(4, 10)]
+
+
 def test_read_segments_concatenates_in_order():
     """MPEG-TS segments of one stream are concatenated in their order."""
     data = {"a": b"A" * 3, "b": b"B", "c": b"CC"}
     with mock.patch.object(linto_catchup, "_read_bytes", side_effect=data.get):
         assert linto_catchup.read_segments(["a", "b", "c"]) == b"AAABCC"
     assert linto_catchup.read_segments([]) == b""
+
+
+@pytest.mark.parametrize(
+    ("mode", "studio", "segments"),
+    (
+        ("transcript", True, True),
+        ("transcript", False, False),
+        ("screen_recording", True, False),
+    ),
+)
+def test_an_audio_recording_is_recorded_as_segments(settings, mode, studio, segments):
+    """With the catch-up on, an audio recording's one egress writes segments."""
+    settings.LINTO_STUDIO_ENABLED = studio
+    assert linto_catchup.records_segments(mode) is segments
+
+
+def test_records_nothing_as_segments_when_the_catchup_is_off(settings):
+    """The feature off: the audio recording keeps its file egress."""
+    settings.LINTO_STUDIO_ENABLED = True
+    settings.LINTO_CATCHUP_ENABLED = False
+    assert linto_catchup.records_segments("transcript") is False
+
+
+def test_a_segmented_recording_is_marked_on_the_recording():
+    """The mode is kept with the recording."""
+    assert linto_catchup.is_segmented(RecordingFactory(options={"segments": True}))
+    assert not linto_catchup.is_segmented(RecordingFactory(options={}))
+
+
+def test_the_segments_egress_writes_under_the_recording_prefix(settings):
+    """Audio only, 10 s segments and both playlists under catchup/<id>/."""
+    service = linto_catchup.SegmentsEgressService(
+        linto_catchup.WorkerServiceConfig.from_settings()
+    )
+    with mock.patch.object(
+        service,
+        "_handle_request",
+        return_value=api.EgressInfo(egress_id="EG_rec"),
+    ) as handle:
+        assert service.start("room", "rec-1") == "EG_rec"
+    request, method = handle.call_args.args
+    assert method == "start_room_composite_egress"
+    assert request.audio_only is True
+    output = request.segment_outputs[0]
+    assert output.filename_prefix == "catchup/rec-1/seg"
+    assert output.playlist_name == "catchup/rec-1/index.m3u8"
+    assert output.live_playlist_name == "catchup/rec-1/live.m3u8"
+    assert output.segment_duration == 10
+
+
+def test_a_recording_own_segments_egress_is_not_a_side_capture():
+    """A segmented recording's egress is not a side capture."""
+    segmented = RecordingFactory(mode="transcript", options={"segments": True})
+    video = RecordingFactory(mode="screen_recording", options={"transcribe": True})
+    assert not linto_catchup.is_side_capture(_egress(f"catchup/{segmented.id}/seg"))
+    assert linto_catchup.is_side_capture(_egress(f"catchup/{video.id}/seg"))
+    assert linto_catchup.is_side_capture(_egress("catchup/not-a-uuid/seg"))
+    assert not linto_catchup.is_side_capture(_egress("recordings/abc"))
+
+
+def _playlist_object(text, modified=T0):
+    return {
+        "Body": mock.Mock(read=mock.Mock(return_value=text.encode())),
+        "LastModified": modified,
+    }
+
+
+def test_segments_closed_once_the_playlist_ends():
+    """The playlist's end marker says the egress closed the segments."""
+    s3 = mock.MagicMock()
+    with mock.patch.object(linto_catchup, "_s3", return_value=s3):
+        s3.get_object.return_value = _playlist_object(_playlist(T0, ["seg_00000.ts"]))
+        assert linto_catchup.segments_closed_at("r1") is None
+        s3.get_object.return_value = _playlist_object(
+            _playlist(T0, ["seg_00000.ts"]) + "\n#EXT-X-ENDLIST\n"
+        )
+        assert linto_catchup.segments_closed_at("r1") == T0
+    assert s3.get_object.call_args.kwargs["Key"] == "catchup/r1/index.m3u8"
 
 
 def test_live_run_active():
@@ -172,11 +259,21 @@ def test_live_run_active():
 
 @pytest.fixture
 def active_transcript():
-    """An active transcript recording whose starter left the option on."""
+    """An active audio recording written as segments."""
     return RecordingFactory(
         mode="transcript",
         status="active",
-        options={"language": "fr", "catchup": True},
+        options={"language": "fr", "catchup": True, "segments": True},
+    )
+
+
+@pytest.fixture
+def active_video():
+    """An active transcribed video recording with the catch-up option on."""
+    return RecordingFactory(
+        mode="screen_recording",
+        status="active",
+        options={"language": "fr", "catchup": True, "transcribe": True},
     )
 
 
@@ -188,20 +285,43 @@ def no_summary_breaker():
     cache.delete(linto_catchup.SUMMARY_UNAVAILABLE_KEY)
 
 
-FIRST_TURN = {"turn_id": "t0", "segment": "first", "words": [{"stime": 0.5}]}
-
-
 @pytest.fixture
 def studio():
     """A fake Studio client."""
     client = mock.MagicMock()
-    client.upload.return_value = "conv-1"
-    client.first_turn.return_value = dict(FIRST_TURN)
+    client.create.return_value = "conv-1"
     with mock.patch.object(linto_catchup, "StudioClient", return_value=client):
         yield client
 
 
-def _arrive(recording, joined_at, segments=12, **kwargs):
+@pytest.fixture
+def no_speaker_identification():
+    """The organization's voiceprint collection is not looked up."""
+    with mock.patch(
+        "core.services.linto_catchup.resolve_speaker_collection_ids",
+        new=mock.AsyncMock(return_value=["col-1"]),
+    ) as resolve:
+        yield resolve
+
+
+def _hold(recording, covered_until, conversation_id="conv-1"):
+    recording.linto_state = {
+        "catchup": {
+            "conversation_id": conversation_id,
+            "covered_until": _iso(covered_until),
+        }
+    }
+    recording.save()
+
+
+def _held(recording):
+    recording.refresh_from_db()
+    return linto_catchup.held_conversation(recording)
+
+
+@contextmanager
+def _stored(recording, joined_at, segments=12):
+    """The recording's capture, segments and the caller's arrival, as LiveKit and S3 tell."""
     capture = _egress(f"catchup/{recording.id}/seg", started_at=T0)
     with (
         mock.patch.object(linto_catchup, "find_capture", return_value=capture),
@@ -219,35 +339,113 @@ def _arrive(recording, joined_at, segments=12, **kwargs):
             side_effect=lambda keys: b"".join(k.encode() for k in keys),
         ) as read,
     ):
+        yield read
+
+
+def _arrive(recording, joined_at, segments=12, **kwargs):
+    with _stored(recording, joined_at, segments) as read:
         body = linto_catchup.request_brief(recording.room, "alice", **kwargs)
     return body, read
 
 
-def test_first_late_joiner_sends_the_audio_up_to_arrival(active_transcript, studio):
-    """The minutes before the arrival go to Studio, without diarization."""
+def _arrive_and_send(recording, joined_at, segments=12):
+    """An arrival, then the poll that sends its audio."""
+    with _stored(recording, joined_at, segments) as read:
+        linto_catchup.request_brief(recording.room, "alice")
+        body = linto_catchup.request_status(recording.room, str(recording.id))
+    return body, read
+
+
+def test_an_arrival_answers_before_any_audio_is_sent(active_transcript, studio):
+    """The arrival only plans the sending: the browser shows the wait at once."""
     body, read = _arrive(active_transcript, T0 + timedelta(seconds=65))
+
+    assert body["state"] == "sending"
+    assert body["progress"] < 0.05
+    assert body["eta_s"][0] <= body["eta_s"][1]
+    assert body["overdue"] is False
+    read.assert_not_called()
+    studio.create.assert_not_called()
+    job = linto_catchup.load_state(active_transcript.id)["job"]
+    assert job["up_to"] == _iso(T0 + timedelta(seconds=60))
+    assert job["audio_s"] == 60
+
+
+def test_first_late_joiner_creates_the_meeting_conversation(
+    active_transcript, studio, no_speaker_identification
+):
+    """The first late joiner creates the conversation with the transcript's settings."""
+    body, read = _arrive_and_send(active_transcript, T0 + timedelta(seconds=65))
 
     assert body["state"] == "transcribing"
     assert body["recording_id"] == str(active_transcript.id)
     keys = read.call_args.args[0]
     assert keys == [f"catchup/r/seg_{i:05d}.ts" for i in range(6)]
-    audio = studio.upload.call_args.args[0]
+    audio = studio.create.call_args.args[0]
     assert audio == b"".join(k.encode() for k in keys)
-    assert studio.upload.call_args.kwargs["language"] == "fr"
+    assert studio.create.call_args.kwargs == {
+        "name": linto_catchup.conversation_name(active_transcript),
+        "language": "fr",
+        "enable_diarization": True,
+        "members_right": 0,
+        "speaker_collection_ids": ["col-1"],
+    }
+    studio.append.assert_not_called()
     job = linto_catchup.load_state(active_transcript.id)["job"]
     assert job["conversation_id"] == "conv-1"
     assert job["up_to"] == _iso(T0 + timedelta(seconds=60))
     assert job["audio_s"] == 60
+    assert _held(active_transcript) == {
+        "conversation_id": "conv-1",
+        "covered_until": _iso(T0 + timedelta(seconds=60)),
+    }
+
+
+def test_next_to_a_video_the_conversation_only_serves_the_briefs(active_video, studio):
+    """Next to a video, the conversation has no diarization."""
+    _arrive_and_send(active_video, T0 + timedelta(seconds=65))
+    assert studio.create.call_args.kwargs == {
+        "name": f"Visio catch-up {active_video.id}",
+        "language": "fr",
+        "enable_diarization": False,
+        "members_right": 0,
+    }
+
+
+def test_a_later_arrival_appends_only_the_delta(active_transcript, studio):
+    """Only the minutes after the audio sent go, to the same conversation."""
+    _hold(active_transcript, T0 + timedelta(seconds=40))
+    linto_catchup.save_state(
+        active_transcript.id,
+        {
+            "brief": {"text": "Old", "covered_until": _iso(T0 + timedelta(seconds=40))},
+            "job": None,
+            "outcome": "ready",
+        },
+    )
+    _, read = _arrive_and_send(
+        active_transcript, T0 + timedelta(seconds=300), segments=12
+    )
+
+    keys = [f"catchup/r/seg_{i:05d}.ts" for i in range(4, 12)]
+    assert read.call_args.args[0] == keys
+    studio.create.assert_not_called()
+    studio.append.assert_called_once_with("conv-1", b"".join(k.encode() for k in keys))
+    assert _held(active_transcript)["covered_until"] == _iso(
+        T0 + timedelta(seconds=120)
+    )
 
 
 def test_not_late_gets_nothing(active_transcript, studio):
     """A participant present from the start gets nothing; Studio is not called."""
     body, _ = _arrive(active_transcript, T0 + timedelta(seconds=5))
     assert body["state"] == "none"
-    studio.upload.assert_not_called()
+    studio.create.assert_not_called()
 
 
-def test_client_can_only_ask_for_less(active_transcript, studio):
+def test_client_can_only_ask_for_less(
+    active_transcript, studio, no_speaker_identification
+):
     """After a reload, the earlier client join time wins (min)."""
     client_ms = int((T0 + timedelta(seconds=65)).timestamp() * 1000)
     _arrive(
@@ -259,21 +457,23 @@ def test_client_can_only_ask_for_less(active_transcript, studio):
     assert job["up_to"] == _iso(T0 + timedelta(seconds=60))
 
 
-def test_an_arrival_attaches_to_the_running_job(active_transcript, studio):
-    """While a job runs, a new arrival waits for it: no second upload."""
-    _arrive(active_transcript, T0 + timedelta(seconds=65))
+def test_an_arrival_attaches_to_the_running_job(
+    active_transcript, studio, no_speaker_identification
+):
+    """While a job runs, a new arrival waits for it: nothing more is sent."""
+    _arrive_and_send(active_transcript, T0 + timedelta(seconds=65))
     body, _ = _arrive(active_transcript, T0 + timedelta(seconds=95))
     assert body["state"] == "transcribing"
-    assert studio.upload.call_count == 1
+    assert studio.create.call_count == 1
+    studio.append.assert_not_called()
 
 
 def test_a_recent_brief_is_reused(active_transcript, studio):
     """A brief covering up to two minutes before the arrival answers at once."""
+    _hold(active_transcript, T0 + timedelta(seconds=60))
     linto_catchup.save_state(
         active_transcript.id,
         {
-            "transcript": "x" * 50,
-            "covered_until": _iso(T0 + timedelta(seconds=60)),
             "brief": {
                 "text": "Brief",
                 "covered_until": _iso(T0 + timedelta(seconds=60)),
@@ -285,49 +485,33 @@ def test_a_recent_brief_is_reused(active_transcript, studio):
     body, _ = _arrive(active_transcript, T0 + timedelta(seconds=150))
     assert body["state"] == "ready"
     assert body["brief"]["text"] == "Brief"
-    studio.upload.assert_not_called()
-
-
-def test_a_later_arrival_sends_only_the_delta(active_transcript, studio):
-    """Only the minutes after what Meet holds are sent."""
-    linto_catchup.save_state(
-        active_transcript.id,
-        {
-            "transcript": "x" * 50,
-            "covered_until": _iso(T0 + timedelta(seconds=40)),
-            "brief": {"text": "Old", "covered_until": _iso(T0 + timedelta(seconds=40))},
-            "job": None,
-            "outcome": "ready",
-        },
-    )
-    _, read = _arrive(active_transcript, T0 + timedelta(seconds=300), segments=12)
-    assert read.call_args.args[0] == [f"catchup/r/seg_{i:05d}.ts" for i in range(4, 12)]
+    studio.append.assert_not_called()
 
 
 def test_another_arrival_sending_says_sending(active_transcript, studio):
-    """Someone else is uploading: answer "sending", start nothing."""
+    """Someone else is sending audio: answer "sending", start nothing."""
     cache.add(linto_catchup._lock_key(active_transcript.id, "start"), 1, 60)
     try:
         body, _ = _arrive(active_transcript, T0 + timedelta(seconds=65))
     finally:
         cache.delete(linto_catchup._lock_key(active_transcript.id, "start"))
     assert body["state"] == "sending"
-    studio.upload.assert_not_called()
+    studio.create.assert_not_called()
 
 
 def test_nothing_recorded_yet_is_too_short(active_transcript, studio):
     """No segment before the arrival and no brief: too short."""
     body, _ = _arrive(active_transcript, T0 + timedelta(seconds=65), segments=0)
     assert body["state"] == "too_short"
-    studio.upload.assert_not_called()
+    studio.create.assert_not_called()
 
 
 def test_without_capture_the_catchup_is_unavailable(active_transcript, studio):
-    """No capture running: unavailable, Studio is not called."""
+    """No egress writing segments: unavailable, Studio is not called."""
     with mock.patch.object(linto_catchup, "find_capture", return_value=None):
         body = linto_catchup.request_brief(active_transcript.room, "alice")
     assert body["state"] == "unavailable"
-    studio.upload.assert_not_called()
+    studio.create.assert_not_called()
 
 
 def test_without_recording_there_is_nothing():
@@ -342,21 +526,23 @@ def test_a_live_run_of_its_own_serves_instead(active_transcript, studio):
     room.configuration = {"linto": {"session_id": "s1", "org_id": "o1"}}
     room.save()
     assert linto_catchup.request_brief(room, "alice") == {"state": "live"}
-    studio.upload.assert_not_called()
+    studio.create.assert_not_called()
 
 
-def test_live_captions_leave_the_brief_to_the_recording(active_transcript, studio):
+def test_live_captions_leave_the_brief_to_the_recording(
+    active_transcript, studio, no_speaker_identification
+):
     """Live captions on top of the recording keep nothing: the audio brief runs."""
     room = active_transcript.room
     room.configuration = {"linto": {"session_id": "s1", "captions_only": True}}
     room.save()
     active_transcript.refresh_from_db()
     body, _ = _arrive(active_transcript, T0 + timedelta(seconds=65))
-    assert body["state"] == "transcribing"
+    assert body["state"] == "sending"
 
 
 def test_the_owner_needs_the_summary_capability(active_transcript, settings):
-    """No summary right for the owner: no capture, no brief."""
+    """No summary right for the owner: no brief."""
     with mock.patch.object(linto_catchup, "summary_entitled", return_value=False):
         assert linto_catchup.is_eligible(active_transcript) is False
         assert linto_catchup.request_brief(active_transcript.room, "alice") == {
@@ -380,12 +566,10 @@ def test_a_participant_not_in_the_room_is_refused(active_transcript):
 # ── The job, one step per poll: request_status ─────────────────────────────
 
 
-def _running(recording, step="transcribing", transcript="", brief=None, **job):
+def _running(recording, step="transcribing", brief=None, **job):
     linto_catchup.save_state(
         recording.id,
         {
-            "transcript": transcript,
-            "covered_until": None,
             "brief": brief,
             "job": {
                 "conversation_id": "conv-1",
@@ -393,7 +577,7 @@ def _running(recording, step="transcribing", transcript="", brief=None, **job):
                 "up_to": _iso(T0 + timedelta(seconds=60)),
                 "step": step,
                 "started_at": linto_catchup._iso(linto_catchup._now()),
-                "summary_started_at": linto_catchup._iso(linto_catchup._now()),
+                "step_started_at": linto_catchup._iso(linto_catchup._now()),
                 "audio_s": 60,
                 "errors": 0,
                 **job,
@@ -403,21 +587,27 @@ def _running(recording, step="transcribing", transcript="", brief=None, **job):
     )
 
 
-def _conversation(state, *segments):
+def _parts(*states):
+    return [{"id": f"p{i}", "state": state} for i, state in enumerate(states)]
+
+
+def _conversation(*segments):
     return {
-        "jobs": {"transcription": {"state": state}},
-        "text": [{"turn_id": f"t{i}", "segment": s} for i, s in enumerate(segments)],
+        "text": [{"turn_id": f"t{i}", "segment": s} for i, s in enumerate(segments)]
     }
+
+
+LONG_ENOUGH = "La suite de la réunion, assez longue pour un résumé."
 
 
 def _status(recording):
     return linto_catchup.request_status(recording.room, str(recording.id))
 
 
-def test_a_running_transcription_is_reported(active_transcript, studio):
-    """While Studio transcribes, the state says so with an estimate."""
+def test_a_part_being_transcribed_is_reported(active_transcript, studio):
+    """While Studio transcribes a part, the state says so with an estimate."""
     _running(active_transcript)
-    studio.conversation.return_value = _conversation("processing")
+    studio.parts.return_value = _parts("done", "pending")
     body = _status(active_transcript)
     assert body["state"] == "transcribing"
     assert 0 < body["progress"] < 1
@@ -425,58 +615,44 @@ def test_a_running_transcription_is_reported(active_transcript, studio):
     studio.trigger_summary.assert_not_called()
 
 
-def test_first_transcript_asks_for_the_summary(active_transcript, studio):
-    """The first transcript is kept, then summarized as it is."""
+def test_every_part_in_asks_for_a_new_summary(active_transcript, studio):
+    """Once every part is merged, the whole conversation is summarized."""
     _running(active_transcript)
-    studio.conversation.return_value = _conversation(
-        "done", "Bonjour à tous, on commence.", "Le budget est validé."
-    )
+    studio.parts.return_value = _parts("done", "done")
+    studio.conversation.return_value = _conversation("Bonjour à tous.", LONG_ENOUGH)
     body = _status(active_transcript)
 
     assert body["state"] == "summarizing"
-    studio.prepend.assert_not_called()
     studio.trigger_summary.assert_called_once_with("conv-1", ROUTE)
-    state = linto_catchup.load_state(active_transcript.id)
-    assert state["transcript"] == "Bonjour à tous, on commence.\nLe budget est validé."
-    assert state["covered_until"] == _iso(T0 + timedelta(seconds=60))
+    studio.delete.assert_not_called()
 
 
-def test_a_later_transcript_gets_the_previous_text_at_its_head(
-    active_transcript, studio
+def test_a_failed_part_still_leaves_the_rest_to_summarize(
+    active_transcript, studio, caplog
 ):
-    """Only the new minutes were transcribed; the text Meet held goes first."""
-    _running(active_transcript, transcript="Ce qui a été dit avant.")
-    studio.conversation.return_value = _conversation("done", "La suite de la réunion.")
-    _status(active_transcript)
-
-    studio.prepend.assert_called_once_with(
-        "conv-1", "Ce qui a été dit avant.", FIRST_TURN
-    )
-    state = linto_catchup.load_state(active_transcript.id)
-    assert state["transcript"] == "Ce qui a été dit avant.\nLa suite de la réunion."
+    """A part Studio failed to transcribe: a warning, the rest is summarized."""
+    _running(active_transcript)
+    studio.parts.return_value = _parts("done", "error")
+    studio.conversation.return_value = _conversation(LONG_ENOUGH)
+    with caplog.at_level("WARNING", logger="core.services.linto_catchup"):
+        assert _status(active_transcript)["state"] == "summarizing"
+    assert any("last part" in r.getMessage() for r in caplog.records)
 
 
 def test_too_little_said_is_too_short(active_transcript, studio):
-    """Nothing worth summarizing: too short, the conversation goes."""
+    """Nothing worth summarizing: too short, the conversation stays."""
     _running(active_transcript)
-    studio.conversation.return_value = _conversation("done", "Oui.")
+    studio.parts.return_value = _parts("done")
+    studio.conversation.return_value = _conversation("Oui.")
     body = _status(active_transcript)
     assert body["state"] == "too_short"
     studio.trigger_summary.assert_not_called()
-    studio.delete.assert_called_once_with("conv-1")
-
-
-def test_a_failed_transcription_fails_the_job(active_transcript, studio):
-    """Studio failed to transcribe: failed, the conversation goes."""
-    _running(active_transcript)
-    studio.conversation.return_value = _conversation("error")
-    assert _status(active_transcript)["state"] == "failed"
-    studio.delete.assert_called_once_with("conv-1")
+    studio.delete.assert_not_called()
 
 
 def test_the_summary_becomes_the_brief(active_transcript, studio):
-    """Once summarized, the brief is kept and the conversation deleted."""
-    _running(active_transcript, step="summarizing", transcript="x" * 50)
+    """Once summarized, the brief is kept; the conversation stays."""
+    _running(active_transcript, step="summarizing")
     studio.summary.return_value = ("done", "### En cours\nLe budget.")
     body = _status(active_transcript)
 
@@ -485,7 +661,7 @@ def test_the_summary_becomes_the_brief(active_transcript, studio):
         "text": "### En cours\nLe budget.",
         "covered_until": _iso(T0 + timedelta(seconds=60)),
     }
-    studio.delete.assert_called_once_with("conv-1")
+    studio.delete.assert_not_called()
     assert linto_catchup.load_state(active_transcript.id)["job"] is None
 
 
@@ -494,7 +670,6 @@ def test_a_running_summary_is_reported(active_transcript, studio):
     _running(active_transcript, step="summarizing")
     studio.summary.return_value = ("running", None)
     assert _status(active_transcript)["state"] == "summarizing"
-    studio.delete.assert_not_called()
 
 
 def test_a_failed_summary_keeps_the_previous_brief(active_transcript, studio):
@@ -510,18 +685,18 @@ def test_a_failed_summary_keeps_the_previous_brief(active_transcript, studio):
 def test_repeated_studio_errors_fail_the_job(active_transcript, studio):
     """Studio keeps failing: the job is given up after a few polls."""
     _running(active_transcript)
-    studio.conversation.side_effect = linto_catchup.CatchupError("down")
+    studio.parts.side_effect = linto_catchup.CatchupError("down")
     for _ in range(linto_catchup.MAX_STEP_ERRORS - 1):
         assert _status(active_transcript)["state"] == "transcribing"
     assert _status(active_transcript)["state"] == "failed"
 
 
 def test_a_job_past_its_timeout_fails(active_transcript, studio, settings):
-    """A job running too long is given up."""
+    """A job running too long is given up; the conversation stays."""
     settings.LINTO_CATCHUP_JOB_TIMEOUT_S = 1
     _running(active_transcript, started_at=_iso(T0))
     assert _status(active_transcript)["state"] == "failed"
-    studio.delete.assert_called_once_with("conv-1")
+    studio.delete.assert_not_called()
 
 
 def test_one_poll_advances_at_a_time(active_transcript, studio):
@@ -533,7 +708,7 @@ def test_one_poll_advances_at_a_time(active_transcript, studio):
         assert _status(active_transcript)["state"] == "transcribing"
     finally:
         cache.delete(key)
-    studio.conversation.assert_not_called()
+    studio.parts.assert_not_called()
 
 
 def test_status_of_another_room_recording_is_none(active_transcript):
@@ -544,23 +719,111 @@ def test_status_of_another_room_recording_is_none(active_transcript):
     }
 
 
+def _sending(recording):
+    _running(recording, step="sending", conversation_id=None)
+
+
+def _poll_with_segments(recording, segments=12):
+    with _stored(recording, T0 + timedelta(seconds=65), segments):
+        return _status(recording)
+
+
+def test_the_sending_waits_for_another_one(active_transcript, studio):
+    """Audio already being sent (another poll, the end of the recording): wait."""
+    _sending(active_transcript)
+    key = linto_catchup._lock_key(active_transcript.id, "start")
+    cache.add(key, 1, 60)
+    try:
+        assert _poll_with_segments(active_transcript)["state"] == "sending"
+    finally:
+        cache.delete(key)
+    studio.create.assert_not_called()
+
+
+def test_a_sending_refused_by_studio_fails_at_once(
+    active_transcript, studio, no_speaker_identification, caplog
+):
+    """Studio refuses the audio: sending it again would not help."""
+    _sending(active_transcript)
+    studio.create.side_effect = linto_catchup.StudioHTTPError(
+        "Studio: HTTP 400", 400, ""
+    )
+    with caplog.at_level("WARNING", logger="core.services.linto_catchup"):
+        assert _poll_with_segments(active_transcript)["state"] == "failed"
+    assert any("refused by Studio" in r.getMessage() for r in caplog.records)
+    assert studio.create.call_count == 1
+
+
+def test_a_sending_failing_on_studio_side_is_tried_again(
+    active_transcript, studio, no_speaker_identification
+):
+    """Studio down while sending: the next poll sends again."""
+    _sending(active_transcript)
+    studio.create.side_effect = [
+        linto_catchup.StudioHTTPError("Studio: HTTP 503", 503, ""),
+        "conv-1",
+    ]
+    assert _poll_with_segments(active_transcript)["state"] == "sending"
+    assert _poll_with_segments(active_transcript)["state"] == "transcribing"
+
+
+def test_the_end_of_the_recording_may_have_sent_the_minutes(active_transcript, studio):
+    """The hand-over sent everything: the job goes on with the finished conversation."""
+    _sending(active_transcript)
+    _hold(active_transcript, T0 + timedelta(seconds=120))
+    body = _poll_with_segments(active_transcript)
+    assert body["state"] == "transcribing"
+    assert body["up_to"] == _iso(T0 + timedelta(seconds=120))
+    studio.create.assert_not_called()
+    studio.append.assert_not_called()
+
+
+def test_no_conversation_is_created_once_the_recording_ended(active_transcript, studio):
+    """The recording ended before the first sending: its audio is uploaded whole."""
+    _sending(active_transcript)
+    active_transcript.status = "stopped"
+    active_transcript.save()
+    assert _poll_with_segments(active_transcript)["state"] == "failed"
+    studio.create.assert_not_called()
+
+
+def test_a_step_running_late_has_no_estimate(active_transcript, studio):
+    """Past the step's longest estimate, the time left is not made up."""
+    _running(active_transcript, step_started_at=_iso(T0))
+    studio.parts.return_value = _parts("pending")
+    body = _status(active_transcript)
+    assert body["state"] == "transcribing"
+    assert body["eta_s"] is None
+    assert body["overdue"] is True
+    assert body["progress"] == pytest.approx(
+        linto_catchup.STEP_PROGRESS["transcribing"]
+    )
+
+
+def test_the_previous_brief_shows_while_the_next_is_prepared(active_transcript, studio):
+    """A new job keeps the last brief in view."""
+    brief = {"text": "Old", "covered_until": _iso(T0)}
+    _running(active_transcript, brief=brief)
+    studio.parts.return_value = _parts("pending")
+    body = _status(active_transcript)
+    assert body["state"] == "transcribing"
+    assert body["brief"] == {"text": "Old", "covered_until": _iso(T0)}
+
+
 # ── The summary service missing or failing ─────────────────────────────────
 
 
-def _done_transcript(
-    studio, text="La suite de la réunion, assez longue pour un résumé."
-):
-    studio.conversation.return_value = _conversation("done", text)
+def _every_part_in(studio):
+    studio.parts.return_value = _parts("done")
+    studio.conversation.return_value = _conversation(LONG_ENOUGH)
 
 
 def test_a_missing_summary_service_ends_the_job_at_once_with_a_warning(
     active_transcript, studio, caplog
 ):
-    """Studio cannot run the summary service (missing on the gateway, no
-    gateway): the job ends at the first poll, a warning names the service, and
-    the text Meet took is kept once."""
+    """A missing summary service ends the job at once with a warning."""
     _running(active_transcript)
-    _done_transcript(studio)
+    _every_part_in(studio)
     studio.trigger_summary.side_effect = linto_catchup.StudioHTTPError(
         "Studio POST /conversations/conv-1/download: HTTP 502",
         502,
@@ -570,15 +833,12 @@ def test_a_missing_summary_service_ends_the_job_at_once_with_a_warning(
         body = _status(active_transcript)
 
     assert body["state"] == "failed"
-    studio.delete.assert_called_once_with("conv-1")
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any(
         ROUTE in m and "Request failed with status code 404" in m and "UPGRADE.md" in m
         for m in warnings
     ), warnings
     assert ROUTE in linto_catchup.summary_unavailable()
-    state = linto_catchup.load_state(active_transcript.id)
-    assert state["transcript"] == "La suite de la réunion, assez longue pour un résumé."
 
 
 def test_after_a_summary_failure_new_arrivals_send_nothing(active_transcript, studio):
@@ -592,7 +852,7 @@ def test_after_a_summary_failure_new_arrivals_send_nothing(active_transcript, st
         "recording_id": str(active_transcript.id),
     }
     read.assert_not_called()
-    studio.upload.assert_not_called()
+    studio.create.assert_not_called()
 
 
 def test_a_ready_brief_is_still_served_after_a_summary_failure(
@@ -603,8 +863,6 @@ def test_a_ready_brief_is_still_served_after_a_summary_failure(
     linto_catchup.save_state(
         active_transcript.id,
         {
-            "transcript": "x" * 50,
-            "covered_until": _iso(T0 + timedelta(seconds=60)),
             "brief": {
                 "text": "Brief",
                 "covered_until": _iso(T0 + timedelta(seconds=60)),
@@ -618,25 +876,17 @@ def test_a_ready_brief_is_still_served_after_a_summary_failure(
     assert body["brief"]["text"] == "Brief"
 
 
-def test_a_replayed_step_adds_nothing_twice(active_transcript, studio):
-    """Studio unreachable when asked for the summary: the next poll retries
-    the request only, the text and the head turn are not added again."""
-    _running(active_transcript, transcript="Ce qui a été dit avant.")
-    _done_transcript(studio)
+def test_a_replayed_step_asks_for_the_summary_again(active_transcript, studio):
+    """Studio unreachable when asked for the summary: the next poll asks again."""
+    _running(active_transcript)
+    _every_part_in(studio)
     studio.trigger_summary.side_effect = [
         linto_catchup.CatchupError("Studio unreachable: timeout"),
         None,
     ]
     assert _status(active_transcript)["state"] == "transcribing"
     assert _status(active_transcript)["state"] == "summarizing"
-
-    assert studio.prepend.call_count == 1
-    assert studio.first_turn.call_count == 1
     assert studio.trigger_summary.call_count == 2
-    state = linto_catchup.load_state(active_transcript.id)
-    assert state["transcript"] == (
-        "Ce qui a été dit avant.\nLa suite de la réunion, assez longue pour un résumé."
-    )
 
 
 def test_a_failed_summary_job_marks_the_service_unavailable(
@@ -690,25 +940,94 @@ def http():
         yield request
 
 
-def test_prepend_keeps_the_first_turn_words(http):
-    """The first turn takes the text with its own words; the original follows."""
-    first = {"turn_id": "t0", "segment": "Bonjour", "words": [{"stime": 0.5}]}
-    http.side_effect = [
-        _response(200, {"text": [first, {"turn_id": "t1", "segment": "Suite"}]}),
-        _response(200, {}),
-        _response(200, {}),
-    ]
-    client = linto_catchup.StudioClient()
-    client.prepend("c1", "Avant", client.first_turn("c1"))
+@pytest.fixture
+def sdk():
+    """The ``linto`` SDK, with a fixed credential."""
+    linto = mock.MagicMock()
+    linto.upload = mock.AsyncMock(return_value="conv-1")
+    linto.append = mock.AsyncMock(return_value={})
+    linto.complete = mock.AsyncMock(return_value={})
+    with (
+        mock.patch.object(linto_catchup.StudioClient, "_token", return_value="tok"),
+        mock.patch("linto.LinTO", return_value=linto) as linto_class,
+    ):
+        linto.linto_class = linto_class
+        yield linto
 
-    patch_call, post_call = http.call_args_list[1], http.call_args_list[2]
-    assert patch_call.args == (
-        "PATCH",
-        "http://studio-api/api/conversations/c1/turns/t0",
+
+def _http_error(status):
+    return aiohttp.ClientResponseError(
+        request_info=mock.MagicMock(), history=(), status=status, message="refused"
     )
-    assert patch_call.kwargs["json"] == {**first, "segment": "Avant"}
-    assert post_call.args == ("POST", "http://studio-api/api/conversations/c1/turns/t0")
-    assert post_call.kwargs["json"] == {"segment": "Bonjour", "words": [{"stime": 0.5}]}
+
+
+def test_create_opens_the_conversation_to_appended_audio(sdk):
+    """The SDK uploads the first minutes with partial."""
+    created = linto_catchup.StudioClient().create(
+        b"TS", name="Reunion", language="fr", enable_diarization=True
+    )
+    assert created == "conv-1"
+    assert sdk.upload.call_args.kwargs == {
+        "file": b"TS",
+        "number_of_speaker": "0",
+        "enablePunctuation": True,
+        "partial": True,
+        "name": "Reunion",
+        "language": "fr",
+        "enable_diarization": True,
+    }
+    assert sdk.linto_class.call_args.kwargs == {
+        "auth_token": "tok",
+        "base_url": "http://studio-api",
+    }
+
+
+def test_append_and_complete_go_through_the_sdk(sdk):
+    """The audio is appended, then the conversation closed."""
+    client = linto_catchup.StudioClient()
+    client.append("conv-1", b"TS")
+    client.complete("conv-1")
+    sdk.append.assert_awaited_once_with("conv-1", b"TS")
+    sdk.complete.assert_awaited_once_with("conv-1")
+
+
+def test_an_sdk_refusal_is_a_studio_http_error(sdk):
+    """Studio's status is kept: a 4xx falls back, a 5xx is retried."""
+    sdk.append.side_effect = _http_error(404)
+    with pytest.raises(linto_catchup.StudioHTTPError) as raised:
+        linto_catchup.StudioClient().append("conv-1", b"TS")
+    assert raised.value.status == 404
+
+
+def test_an_sdk_credential_rejected_is_renewed_once(sdk):
+    """A 401 renews the credential and retries once."""
+    sdk.complete.side_effect = [_http_error(401), {}]
+    with mock.patch.object(
+        linto_catchup.StudioClient, "_token", side_effect=["old", "new"]
+    ) as token:
+        linto_catchup.StudioClient().complete("conv-1")
+    assert token.call_args_list == [mock.call(False), mock.call(True)]
+    assert sdk.complete.await_count == 2
+
+
+def test_studio_unreachable_through_the_sdk_is_a_catchup_error(sdk):
+    """A network error becomes a CatchupError."""
+    sdk.upload.side_effect = aiohttp.ClientConnectionError("down")
+    with pytest.raises(linto_catchup.CatchupError) as raised:
+        linto_catchup.StudioClient().create(b"TS", name="n", language="fr")
+    assert not isinstance(raised.value, linto_catchup.StudioHTTPError)
+
+
+def test_parts_are_read_from_the_job(http):
+    """Only the jobs are read to follow the parts."""
+    http.return_value = _response(
+        200, {"jobs": {"transcription": {"parts": _parts("done", "pending")}}}
+    )
+    assert [p["state"] for p in linto_catchup.StudioClient().parts("c1")] == [
+        "done",
+        "pending",
+    ]
+    assert http.call_args.kwargs["params"] == {"key": "jobs"}
 
 
 def test_summary_reads_the_export_of_the_service(http):
@@ -743,15 +1062,15 @@ def test_summary_states(http, exports, status):
     assert linto_catchup.StudioClient().summary("c1", ROUTE)[0] == status
 
 
-def test_trigger_summary_names_the_service(http):
-    """The summary is asked of the catch-up service by its route."""
+def test_trigger_summary_asks_for_a_new_one(http):
+    """Each brief is a new summary of the conversation by the catch-up service."""
     http.return_value = _response(200, {})
     linto_catchup.StudioClient().trigger_summary("c1", ROUTE)
     assert http.call_args.args == (
         "POST",
         "http://studio-api/api/conversations/c1/download",
     )
-    assert http.call_args.kwargs["params"] == {"format": ROUTE}
+    assert http.call_args.kwargs["params"] == {"format": ROUTE, "regenerate": "true"}
 
 
 def test_delete_tolerates_a_missing_conversation(http):
@@ -787,17 +1106,106 @@ def test_studio_unreachable_is_a_catchup_error(http):
         linto_catchup.StudioClient().conversation("c1")
 
 
-# ── End of the recording, reconciler ───────────────────────────────────────
-
-
-def test_the_end_of_the_recording_drops_everything(active_transcript, studio):
-    """The capture stops, a running job's conversation and the state go."""
-    _running(active_transcript, transcript="x")
+def test_the_end_of_the_recording_keeps_the_conversation(active_transcript, studio):
+    """The end of the recording keeps the conversation for the transcription."""
+    _hold(active_transcript, T0 + timedelta(seconds=60))
+    _running(active_transcript)
     with mock.patch.object(linto_catchup, "stop_captures") as stop:
         linto_catchup.on_recording_ended(active_transcript)
     stop.assert_called_once_with(str(active_transcript.room_id), active_transcript.id)
+    studio.delete.assert_not_called()
+    assert linto_catchup.load_state(active_transcript.id)["job"] is None
+    assert _held(active_transcript)["conversation_id"] == "conv-1"
+
+
+def _hand_over(recording, segments=12):
+    with (
+        mock.patch.object(
+            linto_catchup, "list_segments", return_value=_segments(segments)
+        ),
+        mock.patch.object(
+            linto_catchup,
+            "read_segments",
+            side_effect=lambda keys: b"".join(k.encode() for k in keys),
+        ),
+    ):
+        return linto_catchup.hand_over(recording)
+
+
+def test_hand_over_sends_the_last_minutes_and_finishes(active_transcript, studio):
+    """The last minutes are sent, then the conversation is closed."""
+    _hold(active_transcript, T0 + timedelta(seconds=60))
+    assert _hand_over(active_transcript) == "conv-1"
+
+    keys = [f"catchup/r/seg_{i:05d}.ts" for i in range(6, 12)]
+    studio.append.assert_called_once_with("conv-1", b"".join(k.encode() for k in keys))
+    studio.complete.assert_called_once_with("conv-1")
+    assert _held(active_transcript)["covered_until"] == _iso(
+        T0 + timedelta(seconds=120)
+    )
+
+
+def test_a_replayed_hand_over_sends_nothing_twice(active_transcript, studio):
+    """Studio failed to finish: the retry finishes without sending again."""
+    _hold(active_transcript, T0 + timedelta(seconds=60))
+    studio.complete.side_effect = [
+        linto_catchup.StudioHTTPError("finish: HTTP 503", 503, ""),
+        None,
+    ]
+    with pytest.raises(linto_catchup.StudioHTTPError):
+        _hand_over(active_transcript)
+    active_transcript.refresh_from_db()
+    assert _hand_over(active_transcript) == "conv-1"
+    assert studio.append.call_count == 1
+    assert studio.complete.call_count == 2
+
+
+def test_hand_over_without_conversation_leaves_the_upload(active_transcript, studio):
+    """No late joiner opened a conversation: the whole audio is uploaded."""
+    assert _hand_over(active_transcript) is None
+    studio.append.assert_not_called()
+    studio.complete.assert_not_called()
+
+
+def test_a_refused_hand_over_falls_back_to_the_upload(active_transcript, studio):
+    """A conversation deleted meanwhile falls back to the full upload."""
+    _hold(active_transcript, T0 + timedelta(seconds=60))
+    studio.append.side_effect = linto_catchup.StudioHTTPError(
+        "append: HTTP 404", 404, "Conversation not found"
+    )
+    assert _hand_over(active_transcript) is None
     studio.delete.assert_called_once_with("conv-1")
-    assert linto_catchup.load_state(active_transcript.id)["transcript"] == ""
+    assert not _held(active_transcript)
+
+
+def test_hand_over_waits_for_a_late_joiner_sending(active_transcript, studio):
+    """A late joiner's audio is being sent: the hand-over is retried later."""
+    _hold(active_transcript, T0 + timedelta(seconds=60))
+    cache.add(linto_catchup._lock_key(active_transcript.id, "start"), 1, 60)
+    try:
+        with pytest.raises(linto_catchup.CatchupError):
+            _hand_over(active_transcript)
+    finally:
+        cache.delete(linto_catchup._lock_key(active_transcript.id, "start"))
+    studio.complete.assert_not_called()
+
+
+def test_drop_conversation_deletes_and_forgets(active_video, studio):
+    """Next to a video, the briefs' conversation goes at the end."""
+    _hold(active_video, T0 + timedelta(seconds=60))
+    linto_catchup.drop_conversation(active_video)
+    studio.delete.assert_called_once_with("conv-1")
+    assert not _held(active_video)
+
+
+def test_recording_audio_is_every_segment(active_transcript):
+    """The file of a segmented recording is made of all its segments."""
+    with (
+        mock.patch.object(linto_catchup, "list_segments", return_value=_segments(3)),
+        mock.patch.object(linto_catchup, "read_segments", return_value=b"TS") as read,
+    ):
+        assert linto_catchup.recording_audio(active_transcript) == b"TS"
+    assert read.call_args.args[0] == [f"catchup/r/seg_{i:05d}.ts" for i in range(3)]
 
 
 def test_reconcile_discards_the_state_of_ended_recordings(studio):
@@ -816,38 +1224,23 @@ def test_reconcile_discards_the_state_of_ended_recordings(studio):
     assert linto_catchup.load_state(active.id)["job"] is not None
 
 
-# ── Segments deletion task ─────────────────────────────────────────────────
-
-
-def test_segments_go_once_the_capture_stopped_even_if_the_recording_reads_active(
-    active_transcript,
-):
-    """After its egress ended, a recording reads "active" until its file is
-    seen in the storage: its segments still go once the capture stopped."""
-    from core.tasks.linto_catchup import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
-        delete_linto_catchup_segments,
-    )
-
+def test_reconcile_keeps_segments_until_the_transcription_read_them():
+    """Segments stay until the transcription read them, or too long."""
+    waiting = RecordingFactory(mode="transcript", status="notification_succeeded")
+    failed = RecordingFactory(mode="transcript", status="notification_failed")
+    old = RecordingFactory(mode="transcript", status="saved")
+    old.created_at = linto_catchup._now() - timedelta(days=3)
+    old.save()
+    prefixes = [str(waiting.id), str(failed.id), str(old.id), "not-a-uuid"]
     with (
-        mock.patch.object(linto_catchup, "find_capture", return_value=None),
+        mock.patch.object(linto_catchup, "_list_active_egresses", return_value=[]),
+        mock.patch.object(linto_catchup, "list_prefixes", return_value=prefixes),
         mock.patch.object(linto_catchup, "delete_segments") as delete,
     ):
-        delete_linto_catchup_segments(str(active_transcript.id))
-    delete.assert_called_once_with(str(active_transcript.id))
-
-
-def test_segments_stay_while_the_capture_runs(active_transcript):
-    """A capture still writing keeps its segments."""
-    from core.tasks.linto_catchup import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
-        delete_linto_catchup_segments,
-    )
-
-    with (
-        mock.patch.object(linto_catchup, "find_capture", return_value=_egress("x")),
-        mock.patch.object(linto_catchup, "delete_segments") as delete,
-    ):
-        delete_linto_catchup_segments(str(active_transcript.id))
-    delete.assert_not_called()
+        result = linto_catchup.reconcile()
+    deleted = {call.args[0] for call in delete.call_args_list}
+    assert deleted == {str(failed.id), str(old.id), "not-a-uuid"}
+    assert result["deleted"] == 3
 
 
 # ── Webhooks ────────────────────────────────────────────────────────────────
@@ -872,22 +1265,59 @@ def test_catchup_egress_events_are_acknowledged(mock_receive, events_service):
 
 
 @mock.patch("core.services.room_management.RoomManagement.update_metadata")
+@mock.patch.object(api.WebhookReceiver, "receive")
+def test_a_segmented_recording_egress_updates_the_recording(
+    mock_receive, _metadata, events_service
+):
+    """A segmented recording's egress events reach the recording handlers."""
+    recording = RecordingFactory(
+        worker_id="EG_rec",
+        mode="transcript",
+        status="initiated",
+        options={"segments": True},
+    )
+    data = api.WebhookEvent(event="egress_updated")
+    data.egress_info.CopyFrom(_egress(f"catchup/{recording.id}/seg", "EG_rec"))
+    data.egress_info.status = api.EgressStatus.EGRESS_ACTIVE
+    data.egress_info.room_name = str(recording.room_id)
+    mock_receive.return_value = data
+    request = mock.MagicMock(headers={"Authorization": "token"}, body=b"{}")
+
+    with mock.patch.object(
+        events_service.recording_events, "handle_update"
+    ) as handle_update:
+        events_service.receive(request)
+    handle_update.assert_called_once()
+
+
+def test_a_segmented_recording_starts_no_side_capture(active_transcript):
+    """Its own egress writes the segments: no second egress."""
+    with mock.patch.object(linto_catchup, "_start_segments_egress") as start:
+        assert linto_catchup.start_capture(active_transcript) is None
+    start.assert_not_called()
+
+
+@mock.patch("core.services.room_management.RoomManagement.update_metadata")
 @mock.patch.object(linto_catchup, "start_capture")
 def test_main_egress_active_starts_capture(mock_start, _metadata, events_service):
-    """An audio transcript recording reaching ACTIVE starts the capture at once."""
+    """A recording reaching ACTIVE asks for its capture."""
     recording = RecordingFactory(
         worker_id="EG_main",
-        mode="transcript",
+        mode="screen_recording",
         status="active",
-        options={"catchup": True},
+        options={"catchup": True, "transcribe": True},
     )
     data = mock.MagicMock()
     data.egress_info.egress_id = "EG_main"
     data.egress_info.status = api.EgressStatus.EGRESS_ACTIVE
 
-    events_service._handle_egress_updated(data)
+    with mock.patch(
+        "core.tasks.linto_catchup.start_linto_catchup_capture.apply_async"
+    ) as delayed:
+        events_service._handle_egress_updated(data)
 
-    mock_start.assert_called_once_with(recording)
+    mock_start.assert_not_called()
+    assert delayed.call_args.kwargs["args"] == [str(recording.id)]
 
 
 @mock.patch("core.services.room_management.RoomManagement.update_metadata")
@@ -921,19 +1351,3 @@ def test_main_egress_ended_stops_capture(mock_ended, _metadata, events_service):
 
     mock_ended.assert_called_once()
     assert mock_ended.call_args.args[0].id == recording.id
-
-
-@mock.patch("core.services.room_management.RoomManagement.update_metadata")
-@mock.patch.object(linto_catchup, "start_capture")
-def test_recording_without_the_option_starts_nothing(
-    mock_start, _metadata, events_service
-):
-    """The starter turned the catch-up option off: no capture at all."""
-    RecordingFactory(worker_id="EG_main", mode="transcript", status="active")
-    data = mock.MagicMock()
-    data.egress_info.egress_id = "EG_main"
-    data.egress_info.status = api.EgressStatus.EGRESS_ACTIVE
-
-    events_service._handle_egress_updated(data)
-
-    mock_start.assert_not_called()

@@ -217,7 +217,7 @@ class LiveKitEventsService:
 
         # LinTO catch-up (fork): the side capture egress is not a Recording;
         # its events are acknowledged here instead of failing with a 500.
-        if data.egress_info.egress_id and linto_catchup.catchup_segment_prefix(
+        if data.egress_info.egress_id and linto_catchup.is_side_capture(
             data.egress_info
         ):
             self._handle_catchup_egress(data)
@@ -381,15 +381,6 @@ class LiveKitEventsService:
             return
         try:
             linto_catchup.on_recording_ended(recording)
-            # Local import: core.tasks imports the models at module scope.
-            from core.tasks.linto_catchup import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
-                delete_linto_catchup_segments,
-            )
-
-            delete_linto_catchup_segments.apply_async(
-                args=[str(recording.id)],
-                countdown=settings.LINTO_CATCHUP_DELETE_DELAY_S,
-            )
         except Exception:  # pylint: disable=broad-exception-caught
             logger.exception("Catch-up capture stop failed for %s", recording.id)
 

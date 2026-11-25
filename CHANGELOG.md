@@ -10,6 +10,8 @@ and this project adheres to
 
 ### Added
 
+- ✨(backend) one Studio conversation per meeting for the late joiners' brief, the transcript at the end
+- ✨(backend) an audio recording is written as segments by its one egress while the catch-up is on
 - ✨(backend) accept OIDC access tokens on the core API for native apps, opt-in and per client
 - ✨(frontend) "before you arrived" opens the side panel, from a live run or the recording
 - ✨(backend) late joiners' brief from the recording's audio, through Studio's standard API

@@ -798,7 +798,6 @@ class BotTranscriptionService:
                 "summary_service",
                 "share_summary",
                 "record",
-                "catchup",
             )
             run = self.mark_started(
                 room,
@@ -1111,11 +1110,11 @@ class BotTranscriptionService:
         ``channel_id``, ``org_id``, ``bot_id``) plus the add-ons
         (``summary`` default True, ``summary_service`` the chosen summary
         service route, ``share_summary`` default False = the summary also goes
-        to the signed-in participants, ``record`` default False, ``catchup``
-        default True = a late joiner gets the "before you arrived" summary,
+        to the signed-in participants, ``record`` default False,
         ``keep_audio`` the channel's ``keepAudio``, ``captions_only`` default
         False = a run beside a recording, which turns every add-on off and
-        keeps nothing). Re-checks the
+        keeps nothing). A late joiner always gets the "before you arrived"
+        summary (``catchup``), but in a captions-only run. Re-checks the
         transcript permission (defence in depth), drops both summaries without
         the ``summary`` capability, starts the optional video egress when allowed,
         persists ``room.configuration["linto"]`` and sets the banner. Returns the
@@ -1128,7 +1127,7 @@ class BotTranscriptionService:
                 "the organizer restricts transcription to administrators/owners"
             )
         summary = bool(data.get("summary", True))
-        catchup = bool(data.get("catchup", True))
+        catchup = True
         record = bool(data.get("record", False))
         # The run keeps the meeting audio when its channel was created with
         # keepAudio, which follows the instance (LINTO_LIVE_KEEP_AUDIO). It

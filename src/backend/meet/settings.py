@@ -1288,10 +1288,7 @@ class Base(Configuration):
         environ_name="LINTO_SPEAKER_IDENTIFICATION_ENABLED",
         environ_prefix=None,
     )
-    # Catch-up without live transcription: a side audio-only egress writes HLS
-    # segments of a transcribed recording into this bucket; a late joiner gets
-    # a brief of what was said before they arrived, made through Studio's
-    # standard API (core/services/linto_catchup.py).
+    # LinTO catch-up without live transcription (core/services/linto_catchup.py).
     LINTO_CATCHUP_ENABLED = values.BooleanValue(
         False, environ_name="LINTO_CATCHUP_ENABLED", environ_prefix=None
     )
@@ -1310,9 +1307,6 @@ class Base(Configuration):
     # the video egress is released, so admission co-locates it on a busy pod.
     LINTO_CATCHUP_VIDEO_START_DELAY_S = values.PositiveIntegerValue(
         15, environ_name="LINTO_CATCHUP_VIDEO_START_DELAY_S", environ_prefix=None
-    )
-    LINTO_CATCHUP_DELETE_DELAY_S = values.PositiveIntegerValue(
-        60, environ_name="LINTO_CATCHUP_DELETE_DELAY_S", environ_prefix=None
     )
     # The LLM Gateway summary service (route) that writes the brief.
     LINTO_CATCHUP_SUMMARY_SERVICE = values.Value(

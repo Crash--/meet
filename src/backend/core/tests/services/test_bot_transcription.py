@@ -219,13 +219,13 @@ class TestMarkStarted:
         assert result["share_summary"] is False
         assert "attendees" not in result
 
-    def test_persists_the_late_joiner_summary_choice(self, studio_settings):
+    def test_the_late_joiner_summary_is_always_on(self, studio_settings):
         room, owner = _owner_room()
         data = {"session_id": "s", "channel_id": "c", "catchup": False}
         result = BotTranscriptionService().mark_started(room, data, user=owner)
-        assert result["catchup"] is False
+        assert result["catchup"] is True
         room.refresh_from_db()
-        assert room.configuration["linto"]["catchup"] is False
+        assert room.configuration["linto"]["catchup"] is True
 
     def test_persists_the_chosen_summary_service(self, studio_settings):
         room, owner = _owner_room()
@@ -1516,11 +1516,11 @@ class TestStart:
         assert "LinTO catch-up status unknown" in caplog.text
 
     @responses.activate
-    def test_a_run_without_catchup_checks_nothing(self, run_settings):
+    def test_a_run_always_checks_its_catchup(self, run_settings):
         room, owner = _owner_room()
         _mock_studio_start()
         BotTranscriptionService().start(room, {"catchup": False}, user=owner)
-        assert not _calls("GET", CATCHUP_STATUS_URL)
+        assert _calls("GET", CATCHUP_STATUS_URL)
 
     @responses.activate
     def test_a_bot_failure_stops_the_session_it_created(self, run_settings):

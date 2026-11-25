@@ -1,24 +1,8 @@
-"""LinTO catch-up without live transcription (fork).
-
-While a transcribed recording runs and its starter left the catch-up option on,
-a side audio-only egress writes the room's audio as 10 s HLS segments into
-Meet's bucket, under ``<LINTO_CATCHUP_PREFIX>/<recording id>/``. Nothing is
-processed during the meeting.
-
-When a participant joins late, Meet sends Studio only the minutes it has not
-sent yet, through the standard API the deferred transcription already uses
-(an upload without diarization), and keeps the returned text. Before asking for
-the summary, it puts the text it already held at the head of that conversation,
-so the LLM Gateway service (``LINTO_CATCHUP_SUMMARY_SERVICE``) summarizes the
-whole meeting. It keeps the brief and deletes the conversation. Every exchange
-starts from Meet; the state lives in Meet's cache, one entry per recording.
-
-Meet's own recording is never touched: its OGG output cannot carry segments,
-and a segment upload failure would end it.
-"""
+"""LinTO catch-up without live transcription (fork): the late joiners' brief."""
 
 # pylint: disable=no-member,too-many-lines
 
+import asyncio
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +14,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.core.files.storage import default_storage
 
+import aiohttp
 import botocore
 import requests
 from asgiref.sync import async_to_sync
@@ -37,6 +22,9 @@ from livekit import api as livekit_api
 
 from core import models, utils
 from core.entitlements.capabilities import summary_entitled
+from core.recording.worker.exceptions import WorkerResponseError
+from core.recording.worker.factories import WorkerServiceConfig
+from core.recording.worker.services import BaseEgressService
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +38,11 @@ STATE_TTL = 12 * 3600
 START_LOCK_TTL = UPLOAD_TIMEOUT + 30
 STEP_LOCK_TTL = 60
 MAX_STEP_ERRORS = 5
+SEND_ETA_S = (2, 30)
+TRANSCRIBE_ETA_FLOOR_S = 60
 SUMMARY_ETA_S = (5, 60)
+# Where the progress bar stands at the end of each step.
+STEP_PROGRESS = {"sending": 0.05, "transcribing": 0.8, "summarizing": 0.95}
 # After the summary service failed, new jobs wait this long (no audio sent nor
 # transcribed for a brief that cannot be written).
 SUMMARY_UNAVAILABLE_KEY = "linto_catchup:summary_unavailable"
@@ -58,9 +50,12 @@ SUMMARY_RETRY_S = 300
 
 PLAYLIST_NAME = "index.m3u8"
 LIVE_PLAYLIST_NAME = "live.m3u8"
+PLAYLIST_END = "#EXT-X-ENDLIST"
 SEGMENT_PREFIX = "seg"
 _SEGMENT_RE = re.compile(r"^seg_(\d+)\.ts$")
 READ_WORKERS = 8
+SEGMENTS_MAX_AGE = timedelta(days=2)
+SETTLED_PARTS = ("done", "error")
 
 # States in which the browser keeps polling.
 RUNNING_STATES = ("sending", "transcribing", "summarizing")
@@ -91,17 +86,34 @@ def is_enabled() -> bool:
     return bool(settings.LINTO_CATCHUP_ENABLED and settings.LINTO_STUDIO_BASE_URL)
 
 
+def records_segments(mode: str) -> bool:
+    """An audio recording is recorded as segments while the catch-up is on."""
+    return bool(
+        is_enabled()
+        and settings.LINTO_STUDIO_ENABLED
+        and mode == models.RecordingModeChoices.TRANSCRIPT
+    )
+
+
+def is_segmented(recording: models.Recording) -> bool:
+    """The recording's own egress writes the segments (no audio file)."""
+    return bool((recording.options or {}).get("segments"))
+
+
+def conversation_name(recording: models.Recording) -> str:
+    """The name of the meeting's transcript in Studio."""
+    return f"Reunion_{recording.created_at.strftime('%d-%m-%Y_%H-%M')}"
+
+
 def is_eligible(recording: models.Recording) -> bool:
-    """A recording whose audio will be transcribed, whose starter left the
-    catch-up option on, and whose owner may have it summarized: the brief is an
-    LLM summary, metered like the end-of-meeting one."""
+    """A transcribed recording whose owner may have it summarized."""
     options = recording.options or {}
     transcribed = (
         recording.mode == models.RecordingModeChoices.TRANSCRIPT
         or options.get("original_mode") == models.RecordingModeChoices.TRANSCRIPT
         or bool(options.get("transcribe"))
     )
-    if not transcribed or not options.get("catchup"):
+    if not transcribed:
         return False
     return summary_entitled(recording_owner(recording))
 
@@ -148,6 +160,18 @@ def recording_id_of(prefix: str) -> Optional[str]:
     return parts[0] if parts and parts[0] else None
 
 
+def is_side_capture(egress_info) -> bool:
+    """A side capture next to a video recording, not a recording's own egress."""
+    prefix = catchup_segment_prefix(egress_info)
+    if not prefix:
+        return False
+    recording_id = recording_id_of(prefix)
+    if not recording_id or not utils.is_uuid(recording_id):
+        return True
+    recording = models.Recording.objects.filter(id=recording_id).only("options").first()
+    return not (recording and is_segmented(recording))
+
+
 # ── Capture lifecycle (LiveKit egress) ─────────────────────────────────────
 
 
@@ -179,19 +203,45 @@ async def _list_active_egresses(room_name: Optional[str] = None):
         await lkapi.aclose()
 
 
+def _segments_request(room_name: str, recording_id, s3):
+    prefix = recording_prefix(recording_id)
+    output = livekit_api.SegmentedFileOutput(
+        filename_prefix=f"{prefix}/{SEGMENT_PREFIX}",
+        playlist_name=f"{prefix}/{PLAYLIST_NAME}",
+        live_playlist_name=f"{prefix}/{LIVE_PLAYLIST_NAME}",
+        segment_duration=settings.LINTO_CATCHUP_SEGMENT_DURATION_S,
+        s3=s3,
+    )
+    return livekit_api.RoomCompositeEgressRequest(
+        room_name=room_name, audio_only=True, segment_outputs=[output]
+    )
+
+
+class SegmentsEgressService(BaseEgressService):
+    """The egress of an audio recording written as segments."""
+
+    hrid = "audio-segments-composite-livekit-egress"
+
+    def start(self, room_name, recording_id, encoding_options=None):
+        """Start writing the room's audio as segments; returns the egress id."""
+        request = _segments_request(room_name, recording_id, self._s3)
+        response = self._handle_request(request, "start_room_composite_egress")
+        if not response.egress_id:
+            raise WorkerResponseError("Egress ID not found in the response.")
+        return response.egress_id
+
+
+def segments_worker_service() -> SegmentsEgressService:
+    """The egress service of a recording written as segments."""
+    return SegmentsEgressService(WorkerServiceConfig.from_settings())
+
+
 @async_to_sync
-async def _start_segments_egress(room_name: str, prefix: str):
+async def _start_segments_egress(room_name: str, recording_id):
     lkapi = utils.create_livekit_client()
     try:
-        output = livekit_api.SegmentedFileOutput(
-            filename_prefix=f"{prefix}/{SEGMENT_PREFIX}",
-            playlist_name=f"{prefix}/{PLAYLIST_NAME}",
-            live_playlist_name=f"{prefix}/{LIVE_PLAYLIST_NAME}",
-            segment_duration=settings.LINTO_CATCHUP_SEGMENT_DURATION_S,
-            s3=livekit_api.S3Upload(**_bucket_args()),
-        )
-        request = livekit_api.RoomCompositeEgressRequest(
-            room_name=room_name, audio_only=True, segment_outputs=[output]
+        request = _segments_request(
+            room_name, recording_id, livekit_api.S3Upload(**_bucket_args())
         )
         return await lkapi.egress.start_room_composite_egress(request)
     except livekit_api.TwirpError as e:
@@ -226,7 +276,7 @@ def find_capture(room_name: str, recording_id) -> Optional[object]:
 def start_capture(recording: models.Recording) -> Optional[str]:
     """Start the side segmented egress of a recording. Idempotent: webhooks
     can be delivered twice. Returns the egress id, or None when not started."""
-    if not is_enabled() or not is_eligible(recording):
+    if not is_enabled() or not is_eligible(recording) or is_segmented(recording):
         return None
     if recording.status != models.RecordingStatusChoices.ACTIVE:
         return None
@@ -234,7 +284,7 @@ def start_capture(recording: models.Recording) -> Optional[str]:
     existing = find_capture(room_name, recording.id)
     if existing is not None:
         return existing.egress_id
-    info = _start_segments_egress(room_name, recording_prefix(recording.id))
+    info = _start_segments_egress(room_name, recording.id)
     logger.info(
         "Catch-up capture %s started for recording %s", info.egress_id, recording.id
     )
@@ -257,19 +307,13 @@ def stop_captures(room_name: str, recording_id=None) -> int:
 
 
 def on_recording_ended(recording: models.Recording):
-    """Main egress ended, whatever the reason: the banner disappears, so the
-    capture must stop now, and what Meet holds for the late joiners goes (a
-    running job's conversation in Studio, the text and the brief). The caller
-    deletes the segments a minute later, once a running upload has read them."""
+    """Stop a side capture and forget the brief; the segments wait for the transcription."""
     stop_captures(str(recording.room_id), recording.id)
     discard_state(recording.id)
 
 
 def reconcile() -> dict:
-    """Stop captures whose recording is no longer active, delete orphan
-    prefixes and the state of ended recordings. Run every minute by a CronJob
-    (`manage.py linto_catchup_reconcile`), never by Meet's Celery beat, which a
-    deferred transcription can hold."""
+    """Stop orphan captures, delete unneeded segments and the state of ended recordings."""
     stopped, deleted, discarded = 0, 0, 0
     active_ids = set()
     for info in _list_active_egresses():
@@ -283,7 +327,7 @@ def reconcile() -> dict:
         _stop_egress(info.egress_id)
         stopped += 1
     for recording_id in list_prefixes():
-        if recording_id in active_ids or _is_active(recording_id):
+        if recording_id in active_ids or _segments_needed(recording_id):
             continue
         delete_segments(recording_id)
         deleted += 1
@@ -298,6 +342,23 @@ def reconcile() -> dict:
 def _is_active(recording_id) -> bool:
     return models.Recording.objects.filter(
         id=recording_id, status=models.RecordingStatusChoices.ACTIVE
+    ).exists()
+
+
+def _segments_needed(recording_id) -> bool:
+    """A recording running, or waiting for its deferred transcription for a while."""
+    if not utils.is_uuid(str(recording_id)):
+        return False
+    waiting = (
+        models.RecordingStatusChoices.ACTIVE,
+        models.RecordingStatusChoices.STOPPED,
+        models.RecordingStatusChoices.SAVED,
+        models.RecordingStatusChoices.NOTIFICATION_SUCCEEDED,
+    )
+    return models.Recording.objects.filter(
+        id=recording_id,
+        status__in=waiting,
+        created_at__gt=_now() - SEGMENTS_MAX_AGE,
     ).exists()
 
 
@@ -418,18 +479,33 @@ def list_segments(recording_id) -> list:
     return result
 
 
-def segments_between(recording_id, after: Optional[datetime], up_to: datetime) -> list:
-    """The segments not sent yet, up to `up_to`: those whose midpoint is after
-    `after` (the end of what Meet already holds) and before `up_to`."""
+def segments_between(
+    recording_id, after: Optional[datetime], up_to: Optional[datetime]
+) -> list:
+    """The segments whose midpoint is after `after` and before `up_to` (None: all)."""
     result = []
     for seg in list_segments(recording_id):
         midpoint = seg["start"] + timedelta(milliseconds=seg["duration_ms"] / 2)
-        if midpoint >= up_to:
+        if up_to is not None and midpoint >= up_to:
             break
         if after is not None and midpoint <= after:
             continue
         result.append(seg)
     return result
+
+
+def segments_closed_at(recording_id) -> Optional[datetime]:
+    """When the egress closed a recording's playlist, or None while it writes it."""
+    key = f"{recording_prefix(recording_id)}/{PLAYLIST_NAME}"
+    try:
+        obj = _s3().get_object(Bucket=default_storage.bucket_name, Key=key)
+    except botocore.exceptions.ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return None
+        raise CatchupError(f"S3 read failed for {key}") from e
+    if PLAYLIST_END not in obj["Body"].read().decode("utf-8"):
+        return None
+    return obj["LastModified"]
 
 
 def list_prefixes() -> list:
@@ -482,10 +558,7 @@ def delete_segments(recording_id) -> int:
 
 
 class StudioClient:
-    """The Studio calls of the catch-up, with the backend credential the
-    deferred transcription uses: the upload goes through the ``linto`` SDK
-    (same ASR service and organization choice), the rest through the
-    conversation routes."""
+    """The Studio calls of the catch-up, with the deferred transcription's credential."""
 
     def __init__(self):
         self.base = (settings.LINTO_STUDIO_BASE_URL or "").rstrip("/")
@@ -508,7 +581,32 @@ class StudioClient:
         cache.set(CREDENTIAL_CACHE_KEY, token, CREDENTIAL_CACHE_TTL)
         return token
 
-    def _call(self, method, path, **kwargs) -> requests.Response:
+    def sdk(self, refresh=False):
+        """The ``linto`` SDK, with the same credential."""
+        from linto import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+            LinTO,
+        )
+
+        return LinTO(auth_token=self._token(refresh), base_url=self.base)
+
+    def _run(self, call):
+        """Run an SDK call, renewing a rejected credential once."""
+        for refresh in (False, True):
+            try:
+                return async_to_sync(call)(self.sdk(refresh))
+            except aiohttp.ClientResponseError as e:
+                if e.status == 401 and not refresh:
+                    continue
+                raise StudioHTTPError(
+                    f"Studio: HTTP {e.status}", e.status, str(e.message)[:200]
+                ) from e
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                raise CatchupError(f"Studio unreachable: {e}") from e
+        raise CatchupError("Studio rejected the credential")
+
+    def _call(
+        self, method, path, timeout=STUDIO_TIMEOUT, **kwargs
+    ) -> requests.Response:
         response = None
         for refresh in (False, True):
             headers = {"Authorization": f"Bearer {self._token(refresh)}"}
@@ -517,7 +615,7 @@ class StudioClient:
                     method,
                     f"{self.base}/api{path}",
                     headers=headers,
-                    timeout=STUDIO_TIMEOUT,
+                    timeout=timeout,
                     **kwargs,
                 )
             except requests.RequestException as e:
@@ -549,57 +647,57 @@ class StudioClient:
             )
         return response
 
-    def upload(self, audio: bytes, *, language: str, name: str) -> str:
-        """Upload the audio for a transcription without diarization; returns
-        the conversation id."""
-        from linto import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
-            LinTO,
-        )
+    def create(self, audio: bytes, **options) -> str:
+        """Create the conversation from the first minutes, open to appended audio."""
 
-        async def _upload():
-            linto = LinTO(auth_token=self._token(), base_url=self.base)
+        async def call(linto):
             return await linto.upload(
                 file=audio,
-                enable_diarization=False,
                 number_of_speaker="0",
-                language=language,
                 enablePunctuation=True,
-                name=name,
-                members_right=0,
+                partial=True,
+                **options,
             )
 
-        try:
-            return async_to_sync(_upload)()
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            raise CatchupError(f"Studio upload failed: {e}") from e
+        return self._run(call)
+
+    def append(self, conversation_id: str, audio: bytes):
+        """Append audio after the parts already sent."""
+
+        async def call(linto):
+            return await linto.append(conversation_id, audio)
+
+        self._run(call)
+
+    def complete(self, conversation_id: str):
+        """Close the conversation, done once its parts are in."""
+
+        async def call(linto):
+            return await linto.complete(conversation_id)
+
+        self._run(call)
+
+    def parts(self, conversation_id: str) -> list:
+        """The parts of the conversation, each with its state."""
+        body = (
+            self._ok(
+                "GET", f"/conversations/{conversation_id}", params={"key": "jobs"}
+            ).json()
+            or {}
+        )
+        transcription = (body.get("jobs") or {}).get("transcription") or {}
+        return transcription.get("parts") or []
 
     def conversation(self, conversation_id: str) -> dict:
         """The conversation: its transcription job and its turns."""
         return self._ok("GET", f"/conversations/{conversation_id}").json() or {}
 
-    def first_turn(self, conversation_id: str) -> dict:
-        """The conversation's first turn, as Studio holds it."""
-        turns = self.conversation(conversation_id).get("text") or []
-        if not turns:
-            raise CatchupError("Studio conversation without turns")
-        return dict(turns[0])
-
-    def prepend(self, conversation_id: str, text: str, first: dict):
-        """Put `text` at the head of the conversation: its first turn (`first`,
-        read before) takes the text, its own words kept (the export drops a
-        turn without timing), and goes back right after it. Replaying it with
-        the same `first` after a failure does not duplicate anything."""
-        path = f"/conversations/{conversation_id}/turns/{first['turn_id']}"
-        self._ok("PATCH", path, json={**first, "segment": text})
-        original = {k: v for k, v in first.items() if k != "turn_id"}
-        self._ok("POST", path, json=original)
-
     def trigger_summary(self, conversation_id: str, service_route: str):
-        """Ask the LLM Gateway service for the summary of the conversation."""
+        """Ask the LLM Gateway service for a new summary of the conversation."""
         self._ok(
             "POST",
             f"/conversations/{conversation_id}/download",
-            params={"format": service_route},
+            params={"format": service_route, "regenerate": "true"},
         )
 
     def summary(self, conversation_id: str, service_route: str):
@@ -664,11 +762,8 @@ def _lock_key(recording_id, name: str) -> str:
 
 
 def load_state(recording_id) -> dict:
-    """What Meet holds for a recording: the text sent so far and the end of the
-    audio it covers, the last brief, the running job and the last outcome."""
+    """The last brief, the running job and the last outcome of a recording."""
     return cache.get(_state_key(recording_id)) or {
-        "transcript": "",
-        "covered_until": None,
         "brief": None,
         "job": None,
         "outcome": None,
@@ -681,16 +776,20 @@ def save_state(recording_id, state: dict):
 
 
 def discard_state(recording_id):
-    """Delete a running job's conversation in Studio and the state."""
-    job = (cache.get(_state_key(recording_id)) or {}).get("job")
-    if job and job.get("conversation_id"):
-        try:
-            StudioClient().delete(job["conversation_id"])
-        except CatchupError as e:
-            logger.warning(
-                "Catch-up conversation %s not deleted: %s", job["conversation_id"], e
-            )
+    """Forget the brief and a running job; the conversation stays."""
     cache.delete(_state_key(recording_id))
+
+
+def held_conversation(recording: models.Recording) -> dict:
+    """The meeting's conversation id and the end of the audio sent to it."""
+    return dict((recording.linto_state or {}).get("catchup") or {})
+
+
+def _hold_conversation(recording: models.Recording, held: dict):
+    if recording.linto_state is None:
+        recording.linto_state = {}
+    recording.linto_state["catchup"] = held
+    recording.save(update_fields=["linto_state", "updated_at"])
 
 
 def _state_recording_ids() -> list:
@@ -760,21 +859,32 @@ def _eta_rtf() -> tuple:
     return low, max(low, high)
 
 
+def _step_bounds(step: str, audio_s: float) -> tuple:
+    """[min, max] seconds a step takes."""
+    if step == "sending":
+        return SEND_ETA_S
+    if step == "transcribing":
+        low_rtf, high_rtf = _eta_rtf()
+        return audio_s * low_rtf, max(TRANSCRIBE_ETA_FLOOR_S, audio_s * high_rtf)
+    return SUMMARY_ETA_S
+
+
 def _estimate(job: dict) -> tuple:
-    """(progress 0..1, [min, max] seconds left) of a running job."""
-    now = _now()
-    if job["step"] == "summarizing":
-        elapsed = (now - _parse_time(job["summary_started_at"])).total_seconds()
-        low = max(0, SUMMARY_ETA_S[0] - elapsed)
-        high = max(low, SUMMARY_ETA_S[1] - elapsed)
-        return 0.85, [round(low), round(high)]
-    elapsed = (now - _parse_time(job["started_at"])).total_seconds()
-    low_rtf, high_rtf = _eta_rtf()
-    audio_s = job.get("audio_s") or 0
-    low = max(0, audio_s * low_rtf - elapsed) + SUMMARY_ETA_S[0]
-    high = max(low, audio_s * high_rtf - elapsed + SUMMARY_ETA_S[1])
-    expected = max(1.0, audio_s * high_rtf)
-    return 0.05 + 0.75 * min(1.0, elapsed / expected), [round(low), round(high)]
+    """(progress 0..1, [min, max] seconds left or None once the step runs late)."""
+    step, audio_s = job["step"], job.get("audio_s") or 0
+    started = _parse_time(job.get("step_started_at") or job["started_at"])
+    elapsed = (_now() - started).total_seconds()
+    low, high = _step_bounds(step, audio_s)
+    steps = list(STEP_PROGRESS)
+    index = steps.index(step)
+    begin = STEP_PROGRESS[steps[index - 1]] if index else 0.0
+    progress = begin + (STEP_PROGRESS[step] - begin) * min(1.0, elapsed / high)
+    if elapsed > high:
+        return progress, None
+    later = [_step_bounds(s, audio_s) for s in steps[index + 1 :]]
+    left_low = max(0.0, low - elapsed) + sum(bounds[0] for bounds in later)
+    left_high = high - elapsed + sum(bounds[1] for bounds in later)
+    return progress, [round(left_low), round(max(left_low, left_high))]
 
 
 def _view(recording, state: dict, joined_at=None) -> dict:
@@ -787,6 +897,7 @@ def _view(recording, state: dict, joined_at=None) -> dict:
     if job:
         body["state"] = job["step"]
         body["progress"], body["eta_s"] = _estimate(job)
+        body["overdue"] = body["eta_s"] is None
         body["up_to"] = job["up_to"]
     elif cache.get(_lock_key(recording.id, "start")) is not None:
         body["state"] = "sending"
@@ -794,57 +905,147 @@ def _view(recording, state: dict, joined_at=None) -> dict:
         body["state"] = "ready"
     else:
         body["state"] = state.get("outcome") or "none"
-    if brief and not job:
+    if brief:
         body["brief"] = {"text": brief["text"], "covered_until": brief["covered_until"]}
     return body
 
 
+async def resolve_speaker_collection_ids(linto, recording_id):
+    """The organization's voiceprint collection for speaker identification, or None."""
+    if not getattr(settings, "LINTO_SPEAKER_IDENTIFICATION_ENABLED", False):
+        return None
+    try:
+        collection_id = await linto.get_org_voiceprint_collection_id()
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception(
+            "Speaker identification resolution failed for %s, continuing without it",
+            recording_id,
+        )
+        return None
+    if collection_id:
+        logger.info(
+            "Speaker identification enabled for %s (collection=%s)",
+            recording_id,
+            collection_id,
+        )
+        return [collection_id]
+    logger.warning(
+        "Speaker identification enabled but no org voiceprint collection found "
+        "for %s; continuing without it",
+        recording_id,
+    )
+    return None
+
+
+def _conversation_options(recording, client) -> dict:
+    """The transcript's settings for an audio recording, a brief's next to a video."""
+    language = (recording.options or {}).get("language") or "*"
+    if not is_segmented(recording):
+        return {
+            "name": f"Visio catch-up {recording.id}",
+            "language": language,
+            "enable_diarization": False,
+            "members_right": 0,
+        }
+    return {
+        "name": conversation_name(recording),
+        "language": language,
+        "enable_diarization": True,
+        "members_right": getattr(settings, "LINTO_STUDIO_MEMBERS_RIGHT", 0),
+        "speaker_collection_ids": async_to_sync(resolve_speaker_collection_ids)(
+            client.sdk(), recording.id
+        ),
+    }
+
+
+def _send(recording, client, held: dict, segments: list) -> dict:
+    """Send the segments to the meeting's conversation, created by the first sending."""
+    audio = read_segments([seg["key"] for seg in segments])
+    if held.get("conversation_id"):
+        client.append(held["conversation_id"], audio)
+    else:
+        held["conversation_id"] = client.create(
+            audio, **_conversation_options(recording, client)
+        )
+    end = segments[-1]["start"] + timedelta(milliseconds=segments[-1]["duration_ms"])
+    held["covered_until"] = _iso(end)
+    _hold_conversation(recording, held)
+    logger.info(
+        "Catch-up audio of recording %s: %d segments (%.0f s, %d bytes) sent, "
+        "conversation %s",
+        recording.id,
+        len(segments),
+        sum(seg["duration_ms"] for seg in segments) / 1000,
+        len(audio),
+        held["conversation_id"],
+    )
+    return held
+
+
 def _start_job(recording, state: dict, up_to: datetime):
-    """Send Studio the minutes not sent yet, up to `up_to`."""
+    """Plan the sending of the minutes not sent yet, up to `up_to`: the next poll sends them."""
+    recording.refresh_from_db(fields=["linto_state"])
+    held = held_conversation(recording)
     segments = segments_between(
-        recording.id, _parse_time(state.get("covered_until")), up_to
+        recording.id, _parse_time(held.get("covered_until")), up_to
     )
     if not segments:
         if not state.get("brief"):
             state["outcome"] = "too_short"
         return
-    audio = read_segments([seg["key"] for seg in segments])
     end = segments[-1]["start"] + timedelta(milliseconds=segments[-1]["duration_ms"])
-    audio_s = sum(seg["duration_ms"] for seg in segments) / 1000
-    language = (recording.options or {}).get("language") or "*"
-    conversation_id = StudioClient().upload(
-        audio, language=language, name=f"Visio catch-up {recording.id}"
-    )
+    now = _iso(_now())
     state["job"] = {
-        "conversation_id": conversation_id,
         "from": _iso(segments[0]["start"]),
         "up_to": _iso(end),
-        "step": "transcribing",
-        "started_at": _iso(_now()),
-        "audio_s": audio_s,
+        "step": "sending",
+        "started_at": now,
+        "step_started_at": now,
+        "audio_s": sum(seg["duration_ms"] for seg in segments) / 1000,
         "errors": 0,
     }
     state["outcome"] = None
-    logger.info(
-        "Catch-up job for recording %s: %d segments (%.0f s, %d bytes) sent, "
-        "conversation %s",
-        recording.id,
-        len(segments),
-        audio_s,
-        len(audio),
-        conversation_id,
+
+
+def _send_job_audio(recording, state: dict):
+    """Send the job's minutes, unless the end of the recording already took them."""
+    job = state["job"]
+    with _locked(recording.id, "start", START_LOCK_TTL) as acquired:
+        if not acquired:
+            return
+        recording.refresh_from_db(fields=["linto_state", "status"])
+        held = held_conversation(recording)
+        segments = segments_between(
+            recording.id,
+            _parse_time(held.get("covered_until")),
+            _parse_time(job["up_to"]),
+        )
+        if segments and (
+            held.get("conversation_id")
+            or recording.status == models.RecordingStatusChoices.ACTIVE
+        ):
+            try:
+                held = _send(recording, StudioClient(), held, segments)
+            except StudioHTTPError as e:
+                if e.status >= 500:
+                    raise
+                logger.warning(
+                    "Catch-up audio of %s refused by Studio: %s", recording.id, e
+                )
+                _end_job(state, "ready" if state.get("brief") else "failed")
+                return
+    if not held.get("conversation_id"):
+        _end_job(state, "ready" if state.get("brief") else "failed")
+        return
+    job.update(
+        conversation_id=held["conversation_id"],
+        up_to=held["covered_until"],
+        step="transcribing",
+        step_started_at=_iso(_now()),
     )
 
 
 def _end_job(state: dict, outcome: str):
-    job = state.get("job") or {}
-    if job.get("conversation_id"):
-        try:
-            StudioClient().delete(job["conversation_id"])
-        except CatchupError as e:
-            logger.warning(
-                "Catch-up conversation %s not deleted: %s", job["conversation_id"], e
-            )
     state["job"] = None
     state["outcome"] = outcome
 
@@ -869,39 +1070,26 @@ def _mark_summary_unavailable(recording, reason: str):
     )
 
 
-def _take_text(recording, state: dict, client, conversation: dict) -> bool:
-    """Once per job, append the new text to what Meet holds and put what it
-    held before at the head of the conversation. Every part is recorded in the
-    job, so a step replayed after a failure never adds anything twice. False
-    when too little was said to summarize (the job then ended)."""
-    job = state["job"]
-    if not job.get("taken"):
-        previous = state.get("transcript") or ""
-        job["held_chars"] = len(previous)
-        state["transcript"] = "\n".join(
-            t for t in (previous, _turns_text(conversation)) if t
-        )
-        state["covered_until"] = job["up_to"]
-        job["taken"] = True
-    if len(state["transcript"]) < settings.LINTO_CATCHUP_MIN_CHARS:
+def _summarize(recording, state: dict, client, conversation_id: str):
+    """Ask for the summary of the whole conversation, unless too little was said."""
+    text = _turns_text(client.conversation(conversation_id))
+    if len(text) < settings.LINTO_CATCHUP_MIN_CHARS:
         _end_job(state, "ready" if state.get("brief") else "too_short")
-        return False
-    held = state["transcript"][: job.get("held_chars", 0)]
-    if held and not job.get("head_put"):
-        if not job.get("first_turn"):
-            job["first_turn"] = client.first_turn(job["conversation_id"])
-        client.prepend(job["conversation_id"], held, job["first_turn"])
-        job["head_put"] = True
-        logger.info(
-            "Catch-up job of %s: %d characters held before put at the head",
-            recording.id,
-            len(held),
-        )
-    return True
+        return
+    try:
+        client.trigger_summary(conversation_id, settings.LINTO_CATCHUP_SUMMARY_SERVICE)
+    except StudioHTTPError as e:
+        # Asking again on this conversation would not help.
+        _mark_summary_unavailable(recording, f"HTTP {e.status} {e.detail}")
+        _end_job(state, "ready" if state.get("brief") else "failed")
+        return
+    job = state["job"]
+    job["step"] = "summarizing"
+    job["step_started_at"] = _iso(_now())
 
 
-def _advance(recording, state: dict):  # noqa: PLR0911  # pylint: disable=too-many-return-statements
-    """One step of the running job: at most a few short Studio calls."""
+def _advance(recording, state: dict):
+    """One step of the running job: the sending, or a few short Studio calls."""
     job = state["job"]
     if (_now() - _parse_time(job["started_at"])).total_seconds() > (
         settings.LINTO_CATCHUP_JOB_TIMEOUT_S
@@ -909,32 +1097,24 @@ def _advance(recording, state: dict):  # noqa: PLR0911  # pylint: disable=too-ma
         logger.warning("Catch-up job of %s timed out", recording.id)
         _end_job(state, "failed")
         return
-    client = StudioClient()
-    conversation_id = job["conversation_id"]
-    route = settings.LINTO_CATCHUP_SUMMARY_SERVICE
     try:
+        if job["step"] == "sending":
+            _send_job_audio(recording, state)
+            return
+        client = StudioClient()
+        conversation_id = job["conversation_id"]
         if job["step"] == "transcribing":
-            conversation = client.conversation(conversation_id)
-            transcription = (conversation.get("jobs") or {}).get("transcription") or {}
-            if transcription.get("state") == "error":
-                logger.warning("Catch-up transcription of %s failed", recording.id)
-                _end_job(state, "failed")
+            parts = client.parts(conversation_id)
+            if not parts or any(p.get("state") not in SETTLED_PARTS for p in parts):
                 return
-            if transcription.get("state") != "done":
-                return
-            if not _take_text(recording, state, client, conversation):
-                return
-            try:
-                client.trigger_summary(conversation_id, route)
-            except StudioHTTPError as e:
-                # The service is missing, or the gateway cannot run it: asking
-                # again on this conversation would not help.
-                _mark_summary_unavailable(recording, f"HTTP {e.status} {e.detail}")
-                _end_job(state, "ready" if state.get("brief") else "failed")
-                return
-            job["step"] = "summarizing"
-            job["summary_started_at"] = _iso(_now())
+            if parts[-1].get("state") == "error":
+                logger.warning(
+                    "Catch-up transcription of %s failed for its last part",
+                    recording.id,
+                )
+            _summarize(recording, state, client, conversation_id)
         elif job["step"] == "summarizing":
+            route = settings.LINTO_CATCHUP_SUMMARY_SERVICE
             status, text = client.summary(conversation_id, route)
             if status == "running":
                 return
@@ -1043,3 +1223,61 @@ def request_status(room, recording_id: str) -> dict:
                     _advance(recording, state)
                     save_state(recording.id, state)
     return _view(recording, load_state(recording.id))
+
+
+# ── End of the recording: the deferred transcription ───────────────────────
+
+
+def recording_audio(recording: models.Recording) -> bytes:
+    """The whole audio of a segmented recording."""
+    return read_segments([seg["key"] for seg in list_segments(recording.id)])
+
+
+def hand_over(recording: models.Recording) -> Optional[str]:
+    """Send the last minutes and close the conversation; returns it, or None to upload."""
+    with _locked(recording.id, "start", START_LOCK_TTL) as acquired:
+        if not acquired:
+            raise CatchupError("a late joiner's audio is being sent")
+        held = held_conversation(recording)
+        if not held.get("conversation_id"):
+            return None
+        client = StudioClient()
+        try:
+            segments = segments_between(
+                recording.id, _parse_time(held.get("covered_until")), None
+            )
+            if segments:
+                held = _send(recording, client, held, segments)
+            client.complete(held["conversation_id"])
+        except StudioHTTPError as e:
+            if e.status >= 500:
+                raise
+            logger.warning(
+                "Catch-up conversation %s of %s refused the last audio (%s): "
+                "the whole audio is uploaded instead",
+                held["conversation_id"],
+                recording.id,
+                e,
+            )
+            drop_conversation(recording)
+            return None
+        logger.info(
+            "Catch-up conversation %s of %s finished: it is the transcript",
+            held["conversation_id"],
+            recording.id,
+        )
+        return held["conversation_id"]
+
+
+def drop_conversation(recording: models.Recording):
+    """Delete the meeting's conversation and forget it."""
+    held = held_conversation(recording)
+    if not held.get("conversation_id"):
+        return
+    try:
+        StudioClient().delete(held["conversation_id"])
+    except CatchupError as e:
+        logger.warning(
+            "Catch-up conversation %s not deleted: %s", held["conversation_id"], e
+        )
+    _hold_conversation(recording, {})

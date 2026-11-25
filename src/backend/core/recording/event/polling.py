@@ -34,6 +34,7 @@ from django.utils import timezone
 from botocore.exceptions import BotoCoreError, ClientError
 
 from core import models
+from core.services import linto_catchup
 
 from .notification import notification_service
 
@@ -53,6 +54,14 @@ def _head_object(s3_client, bucket: str, key: str):
         }:
             return None
         raise
+
+
+def _recording_written(s3_client, bucket: str, recording):
+    """The HEAD of the recording's file, or its closed playlist for a segmented recording."""
+    if linto_catchup.is_segmented(recording):
+        closed_at = linto_catchup.segments_closed_at(recording.id)
+        return {"LastModified": closed_at} if closed_at else None
+    return _head_object(s3_client, bucket, recording.key)
 
 
 def poll_storage_for_new_recordings() -> int:
@@ -98,8 +107,8 @@ def poll_storage_for_new_recordings() -> int:
     deferred = 0
     for recording in candidates:
         try:
-            head = _head_object(s3_client, bucket, recording.key)
-        except (BotoCoreError, ClientError):
+            head = _recording_written(s3_client, bucket, recording)
+        except (BotoCoreError, ClientError, linto_catchup.CatchupError):
             logger.exception(
                 "Storage polling HEAD failed for recording %s (key=%s)",
                 recording.id,

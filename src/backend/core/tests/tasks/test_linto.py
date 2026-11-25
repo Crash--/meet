@@ -210,6 +210,126 @@ class TestResume:
             storage.connection.meta.client.get_object.assert_not_called()
 
 
+class TestCatchupConversation:
+    """A segmented recording and the late joiners' conversation."""
+
+    @staticmethod
+    def _segmented(linto_state=None, mode=models.RecordingModeChoices.TRANSCRIPT):
+        rec = _make_recording(mode, linto_state=linto_state)
+        rec.options = {"segments": mode == models.RecordingModeChoices.TRANSCRIPT}
+        rec.save(update_fields=["options"])
+        return rec
+
+    @staticmethod
+    def _patch_catchup(stack, **overrides):
+        patches = {
+            "recording_audio": mock.Mock(return_value=b"TS segments"),
+            "hand_over": mock.Mock(return_value=None),
+            "drop_conversation": mock.Mock(),
+            **overrides,
+        }
+        for name, value in patches.items():
+            stack.enter_context(
+                mock.patch.object(linto_task.linto_catchup, name, value)
+            )
+        stack.enter_context(
+            mock.patch.object(
+                linto_task, "extract_audio_from_video", return_value=b"OggS file"
+            )
+        )
+        return patches
+
+    def test_the_audio_file_is_written_from_the_segments(self):
+        """The audio file is written from the segments, then uploaded."""
+        rec = self._segmented()
+        with contextlib.ExitStack() as stack:
+            storage = _patch_storage(stack, b"OggS file")
+            self._patch_catchup(stack)
+            sdk = _patch_sdk(stack)
+            sdk.upload = mock.AsyncMock(side_effect=RuntimeError("stop"))
+
+            with pytest.raises(RuntimeError, match="stop"):
+                linto_task._process_linto_transcription_sync(str(rec.id))
+
+            put = storage.connection.meta.client.put_object.call_args.kwargs
+            assert put["Key"] == rec.key
+            assert put["Body"] == b"OggS file"
+            assert sdk.upload.call_args.kwargs["file"] == b"OggS file"
+            linto_task.extract_audio_from_video.assert_called_once_with(
+                b"TS segments", output_format="ogg", input_suffix=".ts"
+            )
+        rec.refresh_from_db()
+        assert rec.linto_state["steps"]["audio_file"] is True
+
+    def test_a_retry_does_not_write_the_file_again(self):
+        """Once written, the file is not made again on a retry."""
+        rec = self._segmented(linto_state={"steps": {"audio_file": True}})
+        with contextlib.ExitStack() as stack:
+            storage = _patch_storage(stack, b"OggS file")
+            catchup = self._patch_catchup(stack)
+            sdk = _patch_sdk(stack)
+            sdk.upload = mock.AsyncMock(side_effect=RuntimeError("stop"))
+
+            with pytest.raises(RuntimeError, match="stop"):
+                linto_task._process_linto_transcription_sync(str(rec.id))
+
+            catchup["recording_audio"].assert_not_called()
+            storage.connection.meta.client.put_object.assert_not_called()
+
+    def test_the_late_joiners_conversation_becomes_the_transcript(self):
+        """The conversation got its last minutes: no upload, it is polled."""
+        rec = self._segmented(linto_state={"catchup": {"conversation_id": "conv-c"}})
+        with contextlib.ExitStack() as stack:
+            _patch_storage(stack, b"OggS file")
+            self._patch_catchup(stack, hand_over=mock.Mock(return_value="conv-c"))
+            sdk = _patch_sdk(stack)
+            sdk.upload = mock.AsyncMock()
+            sdk.poll_media = mock.AsyncMock(side_effect=RuntimeError("stop-poll"))
+
+            with pytest.raises(RuntimeError, match="stop-poll"):
+                linto_task._process_linto_transcription_sync(str(rec.id))
+
+            sdk.upload.assert_not_called()
+            sdk.poll_media.assert_called_once_with("conv-c")
+        rec.refresh_from_db()
+        assert rec.linto_state["conversation_id"] == "conv-c"
+
+    def test_a_hand_over_held_up_is_retried(self):
+        """A hand-over held up is retried."""
+        rec = self._segmented(linto_state={"catchup": {"conversation_id": "conv-c"}})
+        with contextlib.ExitStack() as stack:
+            _patch_storage(stack, b"OggS file")
+            self._patch_catchup(
+                stack,
+                hand_over=mock.Mock(
+                    side_effect=linto_task.linto_catchup.CatchupError("busy")
+                ),
+            )
+            _patch_sdk(stack)
+
+            with pytest.raises(TransientError):
+                linto_task._process_linto_transcription_sync(str(rec.id))
+
+    def test_next_to_a_video_the_conversation_goes(self):
+        """Next to a video, the conversation is deleted and the video uploaded."""
+        rec = self._segmented(
+            linto_state={"catchup": {"conversation_id": "conv-c"}},
+            mode=models.RecordingModeChoices.SCREEN_RECORDING,
+        )
+        with contextlib.ExitStack() as stack:
+            _patch_storage(stack, b"fake mp4 bytes")
+            catchup = self._patch_catchup(stack)
+            sdk = _patch_sdk(stack)
+            sdk.upload = mock.AsyncMock(side_effect=RuntimeError("stop"))
+
+            with pytest.raises(RuntimeError, match="stop"):
+                linto_task._process_linto_transcription_sync(str(rec.id))
+
+            catchup["drop_conversation"].assert_called_once()
+            catchup["hand_over"].assert_not_called()
+            sdk.upload.assert_called_once()
+
+
 class TestTwakeInstance:
     """The Drive delivery goes to the instance stored at sign-in, never one
     built from an email sub."""

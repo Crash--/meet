@@ -568,6 +568,9 @@ class RoomViewSet(  # pylint: disable=too-many-public-methods
                 options.encoding.resolution, options.encoding.profile
             )
 
+        if linto_catchup.records_segments(mode):
+            options_data["segments"] = True
+
         share_summary = (
             wants_transcription
             and options_data.get("share_summary") is True
@@ -598,7 +601,10 @@ class RoomViewSet(  # pylint: disable=too-many-public-methods
                 status=drf_status.HTTP_409_CONFLICT,
             )
 
-        worker_service = get_worker_service(mode=recording.mode)
+        if linto_catchup.is_segmented(recording):
+            worker_service = linto_catchup.segments_worker_service()
+        else:
+            worker_service = get_worker_service(mode=recording.mode)
         worker_manager = WorkerServiceMediator(worker_service=worker_service)
 
         try:

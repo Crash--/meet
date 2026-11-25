@@ -215,3 +215,40 @@ def test_polling_does_not_notify_a_recording_the_webhook_claimed(fake_s3_client)
 
     assert processed == 0
     notify.assert_not_called()
+
+
+def test_polling_reads_the_closed_playlist_of_a_segmented_recording(
+    fake_s3_client, settings
+):
+    """A segmented recording is notified once its playlist is closed."""
+    settings.RECORDING_STORAGE_POLLING_GRACE_SECONDS = 60
+    running = factories.RecordingFactory(
+        status=models.RecordingStatusChoices.ACTIVE,
+        mode=models.RecordingModeChoices.TRANSCRIPT,
+        options={"segments": True},
+    )
+    ended = factories.RecordingFactory(
+        status=models.RecordingStatusChoices.STOPPED,
+        mode=models.RecordingModeChoices.TRANSCRIPT,
+        options={"segments": True},
+    )
+    closed = {
+        str(running.id): None,
+        str(ended.id): timezone.now() - timedelta(seconds=120),
+    }
+
+    with (
+        mock.patch(
+            "core.services.linto_catchup.segments_closed_at",
+            side_effect=lambda recording_id: closed[str(recording_id)],
+        ),
+        mock.patch(
+            "core.recording.event.notification.NotificationService.notify_external_services",
+            return_value=True,
+        ) as notify,
+    ):
+        processed = polling.poll_storage_for_new_recordings()
+
+    assert processed == 1
+    assert notify.call_args.args[0].id == ended.id
+    fake_s3_client.head_object.assert_not_called()

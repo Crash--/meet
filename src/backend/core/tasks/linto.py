@@ -42,6 +42,7 @@ from asgiref.sync import async_to_sync, sync_to_async
 from core import models
 from core.entitlements.capabilities import summary_entitled
 from core.recording.enums import FileExtension
+from core.services import linto_catchup
 from core.services.audio_extract import extract_audio_from_video
 from core.services.recipients import (
     attendees_with_email,
@@ -385,7 +386,7 @@ async def _generate_document(
                     job_id=job_id,
                     format=pub_format,
                     template_id=template_id,
-                    # Studio scopes the export by the conversation (SDK 1.4.1).
+                    # Studio scopes the export by the conversation.
                     conversation_id=conversation_id,
                 )
                 logger.info(
@@ -740,37 +741,80 @@ def process_linto_transcription(self, recording_id):
     _process_linto_transcription_sync(recording_id)
 
 
-async def _resolve_speaker_collection_ids(linto, recording_id):
-    """Resolve the org voiceprint collection for speaker identification.
+def _catchup_failure_is_transient(step):
+    """A catch-up failure that is not an HTTP answer of Studio is retried."""
 
-    Org-level only and opt-in (``LINTO_SPEAKER_IDENTIFICATION_ENABLED``).
-    Soft-fail — any error (feature or permission unavailable, no collection)
-    falls back to plain diarization (``None``) rather than aborting the upload.
-    """
-    if not getattr(settings, "LINTO_SPEAKER_IDENTIFICATION_ENABLED", False):
-        return None
-    try:
-        collection_id = await linto.get_org_voiceprint_collection_id()
-    except Exception:
-        # Best-effort: never let identification lookup block the upload.
-        logger.exception(
-            "Speaker identification resolution failed for %s, continuing without it",
-            recording_id,
-        )
-        return None
-    if collection_id:
-        logger.info(
-            "Speaker identification enabled for %s (collection=%s)",
-            recording_id,
-            collection_id,
-        )
-        return [collection_id]
-    logger.warning(
-        "Speaker identification enabled but no org voiceprint collection found "
-        "for %s; continuing without it",
-        recording_id,
+    def wrap(func):
+        def call(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except linto_catchup.StudioHTTPError:
+                raise
+            except linto_catchup.CatchupError as e:
+                raise TransientError(f"Transient failure during '{step}': {e}") from e
+
+        return call
+
+    return wrap
+
+
+@sync_to_async
+def _store_segmented_file(recording):
+    """Write a segmented recording's audio file at its usual key."""
+    audio = _catchup_failure_is_transient("read the recording's segments")(
+        linto_catchup.recording_audio
+    )(recording)
+    ogg_audio = extract_audio_from_video(audio, output_format="ogg", input_suffix=".ts")
+    default_storage.connection.meta.client.put_object(
+        Bucket=default_storage.bucket_name,
+        Key=recording.key,
+        Body=ogg_audio,
+        ContentType="audio/ogg",
     )
-    return None
+    return len(audio), len(ogg_audio)
+
+
+async def _take_catchup_conversation(recording):
+    """The late joiners' conversation as the transcript, or None."""
+    if not linto_catchup.held_conversation(recording):
+        return None
+    if not linto_catchup.is_segmented(recording):
+        await sync_to_async(linto_catchup.drop_conversation)(recording)
+        return None
+    with classify_external("hand the meeting's audio over to LinTO Studio"):
+        return await sync_to_async(
+            _catchup_failure_is_transient("hand the meeting's audio over")(
+                linto_catchup.hand_over
+            )
+        )(recording)
+
+
+async def _take_catchup_audio(recording, state):
+    """Write the segmented recording's file, then hand the conversation over."""
+    if linto_catchup.is_segmented(recording) and not step_done(recording, "audio_file"):
+        with classify_external("write the recording's audio file"):
+            sizes = await _store_segmented_file(recording)
+        logger.info(
+            "Audio file of %s written from its segments (%d -> %d bytes)",
+            recording.id,
+            *sizes,
+        )
+        await mark_done(recording, "audio_file")
+    if not state.get("conversation_id"):
+        conversation_id = await _take_catchup_conversation(recording)
+        if conversation_id:
+            state["conversation_id"] = conversation_id
+            await save_state(recording)
+
+
+@sync_to_async
+def _release_segments(recording):
+    if not (linto_catchup.is_enabled() or linto_catchup.is_segmented(recording)):
+        return
+    try:
+        linto_catchup.delete_segments(recording.id)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("Catch-up segments of %s not deleted", recording.id)
 
 
 async def _summary_wanted(options, starter, recording_id):
@@ -801,6 +845,8 @@ async def _process_linto_transcription_sync(recording_id):  # noqa: PLR0915
     state = ensure_state(recording)
     state["attempts"] = int(state.get("attempts", 0)) + 1
     await save_state(recording)
+
+    await _take_catchup_audio(recording, state)
 
     # The recording bytes (fetched from the S3 recording storage — any
     # S3-compatible backend reached via the storage client, not just MinIO) are
@@ -869,8 +915,7 @@ async def _process_linto_transcription_sync(recording_id):  # noqa: PLR0915
     linto = LinTO(auth_token=sdk_token, base_url=settings.LINTO_STUDIO_BASE_URL)
 
     language = recording.options.get("language") or "*"
-    meeting_time = recording.created_at.strftime("%d-%m-%Y_%H-%M")
-    conversation_name = f"Reunion_{meeting_time}"
+    conversation_name = linto_catchup.conversation_name(recording)
 
     # 3. Upload + start transcription — ONLY if not already uploaded. The
     # conversation_id is checkpointed immediately, so a later crash never
@@ -881,7 +926,7 @@ async def _process_linto_transcription_sync(recording_id):  # noqa: PLR0915
             recording_id,
             language,
         )
-        speaker_collection_ids = await _resolve_speaker_collection_ids(
+        speaker_collection_ids = await linto_catchup.resolve_speaker_collection_ids(
             linto, recording_id
         )
 
@@ -1070,6 +1115,8 @@ async def _process_linto_transcription_sync(recording_id):  # noqa: PLR0915
         log_id=recording_id,
         checkpoint=checkpoint,
     )
+
+    await _release_segments(recording)
 
 
 # ── autonomous bot live-summary (no Recording) ───────────────────────────────

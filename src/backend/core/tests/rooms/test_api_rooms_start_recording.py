@@ -18,6 +18,7 @@ from ...authentication.livekit import LIVEKIT_AUTH_SCHEME
 from ...factories import RoomFactory, UserFactory
 from ...models import Recording, RoomAccessLevel
 from ...recording.worker.exceptions import RecordingStartError
+from ...services import linto_catchup
 from ...services.participants_management import (
     ParticipantNotFoundException,
     ParticipantsManagementException,
@@ -1226,3 +1227,32 @@ def test_start_recording_anonymous_is_audited(settings):
 
     assert event["lasuite"]["outcome"] == "denied"
     assert event["lasuite"]["actor"]["type"] == "anonymous"
+
+
+def test_start_recording_audio_as_segments_with_the_linto_catchup(
+    settings, mock_worker_service_factory
+):
+    """With the LinTO catch-up on, an audio recording is written as segments."""
+    settings.RECORDING_ENABLE = True
+    settings.LINTO_STUDIO_ENABLED = True
+    settings.LINTO_CATCHUP_ENABLED = True
+    settings.LINTO_STUDIO_BASE_URL = "http://studio-api"
+    room = RoomFactory()
+    user = UserFactory()
+    room.accesses.create(user=user, role="owner")
+    client = APIClient()
+    client.force_login(user)
+
+    with (
+        mock.patch("core.api.viewsets.has_linto_capability", return_value=True),
+        mock.patch("core.api.viewsets.WorkerServiceMediator") as mediator_class,
+    ):
+        response = client.post(
+            f"/api/v1.0/rooms/{room.id}/start-recording/", {"mode": "transcript"}
+        )
+
+    assert response.status_code == 201
+    mock_worker_service_factory.assert_not_called()
+    worker_service = mediator_class.call_args.kwargs["worker_service"]
+    assert isinstance(worker_service, linto_catchup.SegmentsEgressService)
+    assert Recording.objects.get().options["segments"] is True
