@@ -34,7 +34,8 @@ const formatTime = (ms: number | null, locale: string): string => {
  * "Before you arrived" (fork): the brief of what a late joiner missed, on top
  * of the Tools panel whatever tool view is shown, from a live run of its own
  * or from the recording's audio. The panel opens by itself at arrival; the
- * wait shows here (the steps and an estimate for the audio), then the brief.
+ * wait shows here (the steps and an estimate for the audio, over the previous
+ * brief if any), then the brief, or why there is none.
  * Computed once per arrival; the cross closes it for good.
  */
 export const CatchUpBlock = () => {
@@ -58,6 +59,7 @@ export const CatchUpBlock = () => {
   if (!view) return null
 
   const eta = (() => {
+    if (view.overdue) return t('audioCatchup.overdue')
     if (!view.etaS) return ''
     const [low, high] = view.etaS
     if (high < 60) return t('audioCatchup.etaUnderMinute')
@@ -119,18 +121,21 @@ export const CatchUpBlock = () => {
         </div>
 
         <div aria-live="polite" data-testid="linto-catchup-progress">
-          {view.phase === 'preparing' && (
+          {(view.phase === 'preparing' || view.step) && (
             <div
               className={css({
                 display: 'flex',
                 flexDirection: 'column',
                 gap: '0.375rem',
               })}
+              style={{ marginBottom: view.phase === 'text' ? '0.5rem' : 0 }}
             >
               <Text variant="smNote" as="p">
-                {view.step
-                  ? t(`audioCatchup.step.${view.step}`)
-                  : t('catchup.loading')}
+                {view.phase === 'text'
+                  ? t('audioCatchup.updating')
+                  : view.step
+                    ? t(`audioCatchup.step.${view.step}`)
+                    : t('catchup.loading')}
                 {eta ? ` · ${eta}` : ''}
               </Text>
               {view.progress !== null && (
@@ -165,6 +170,11 @@ export const CatchUpBlock = () => {
           {view.phase === 'too_short' && (
             <Text variant="smNote" as="p" data-testid="linto-catchup-too-short">
               {t('audioCatchup.tooShort')}
+            </Text>
+          )}
+          {view.phase === 'failed' && (
+            <Text variant="smNote" as="p" data-testid="linto-catchup-failed">
+              {t('audioCatchup.failed')}
             </Text>
           )}
         </div>

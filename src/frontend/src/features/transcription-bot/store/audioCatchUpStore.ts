@@ -33,6 +33,8 @@ export type AudioCatchUpState = {
   progress: number
   // [min, max] seconds still to wait, as estimated by the backend.
   etaS: [number, number] | null
+  // The step runs past its estimate.
+  overdue: boolean
   brief: AudioCatchUpBrief | null
   // The reader closed the block: gone for this arrival.
   dismissed: boolean
@@ -46,6 +48,7 @@ export const IDLE_AUDIO_CATCH_UP: AudioCatchUpState = {
   recordingId: null,
   progress: 0,
   etaS: null,
+  overdue: false,
   brief: null,
   dismissed: false,
   error: undefined,

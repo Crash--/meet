@@ -12,8 +12,6 @@
       "stop": "Untertitel beenden"
     },
     "options": {
-      "catchup": "Nachhol-Zusammenfassung",
-      "catchupHint": "Wer eintrifft, sieht eine Zusammenfassung des Verpassten.",
       "summary": "Protokoll am Ende des Meetings",
       "summaryService": "Art des Protokolls",
       "shareSummary": "Mit den Teilnehmenden teilen",

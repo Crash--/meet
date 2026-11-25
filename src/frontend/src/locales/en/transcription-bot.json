@@ -12,8 +12,6 @@
       "stop": "Stop captions"
     },
     "options": {
-      "catchup": "Catch-up summary",
-      "catchupHint": "On arrival, a participant sees a summary of what they missed.",
       "summary": "Summary at the end of the meeting",
       "summaryService": "Type of summary",
       "shareSummary": "Share with the participants",
@@ -60,6 +58,9 @@
       "etaMinutes_one": "about {{count}} minute",
       "etaMinutes_other": "about {{count}} minutes",
       "etaRange": "about {{min}} to {{max}} minutes",
+      "overdue": "taking longer than expected",
+      "updating": "Updating with the rest of the meeting…",
+      "failed": "The summary could not be prepared.",
       "coveredUntil": "Covers the meeting until {{time}}",
       "tooShort": "Too little was said before you arrived to summarize."
     }
@@ -72,9 +73,7 @@
     "summary": "Summary at the end of the meeting",
     "shareSummary": "Share with the participants",
     "record": "Also record the video",
-    "noEntitlement": "Transcription after the meeting is not enabled for your account.",
-    "catchup": "Catch-up summary",
-    "catchupHint": "On arrival, a participant sees a summary of what they missed."
+    "noEntitlement": "Transcription after the meeting is not enabled for your account."
   },
   "banner": {
     "inProgress": "Live transcription"

@@ -25,6 +25,7 @@ export type ApiAudioCatchUp = {
   recording_id?: string
   progress?: number
   eta_s?: [number, number] | null
+  overdue?: boolean
   joined_at?: string
   up_to?: string
   brief?: {
@@ -91,6 +92,7 @@ export const applyAudioCatchUp = (
           ? 1
           : current.progress,
     etaS: Array.isArray(body.eta_s) ? body.eta_s : null,
+    overdue: !!body.overdue,
     brief: toBrief(body.brief, current.brief),
     error: body.reason || undefined,
     updatedAt: Date.now(),

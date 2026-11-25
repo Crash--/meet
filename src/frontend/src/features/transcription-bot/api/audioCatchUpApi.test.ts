@@ -100,5 +100,16 @@ describe('applyAudioCatchUp', () => {
     expect(next.recordingId).toBe('rec')
     expect(next.progress).toBe(0.4)
     expect(next.etaS).toEqual([30, 90])
+    expect(next.overdue).toBe(false)
+  })
+
+  it('says when a step runs past its estimate', () => {
+    const next = applyAudioCatchUp(IDLE_AUDIO_CATCH_UP, {
+      state: 'transcribing',
+      eta_s: null,
+      overdue: true,
+    })
+    expect(next.etaS).toBeNull()
+    expect(next.overdue).toBe(true)
   })
 })

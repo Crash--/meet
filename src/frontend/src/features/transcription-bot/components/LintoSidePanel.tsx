@@ -51,15 +51,8 @@ export const LintoSidePanel = () => {
   })
 
   const { enabled } = useLintoConfig()
-  const {
-    running,
-    catchup,
-    summary,
-    summaryService,
-    shareSummary,
-    record,
-    error,
-  } = useSnapshot(lintoStore)
+  const { running, summary, summaryService, shareSummary, record, error } =
+    useSnapshot(lintoStore)
 
   const apiRoomData = useRoomData()
   const roomId = apiRoomData?.livekit?.room
@@ -173,7 +166,7 @@ export const LintoSidePanel = () => {
               summary: canSummarize && summary,
               summaryService,
               shareSummary: canSummarize && summary && shareSummary,
-              catchup: canSummarize && catchup,
+              catchup: canSummarize,
               record: hasScreenRecordingAccess ? record : false,
               translations,
             },
@@ -358,26 +351,6 @@ export const LintoSidePanel = () => {
             <TranslationPicker isDisabled={controlsDisabled} />
             {canSummarize && (
               <>
-                <Checkbox
-                  size="sm"
-                  data-testid="linto-mode-catchup"
-                  isSelected={catchup}
-                  onChange={(value) => {
-                    lintoStore.catchup = value
-                  }}
-                  isDisabled={controlsDisabled}
-                >
-                  <Text variant="sm">{t('options.catchup')}</Text>
-                </Checkbox>
-                <Text
-                  variant="smNote"
-                  className={css({
-                    paddingLeft: '1.625rem',
-                    marginTop: '-0.5rem',
-                  })}
-                >
-                  {t('options.catchupHint')}
-                </Text>
                 <Checkbox
                   size="sm"
                   data-testid="linto-mode-summary"

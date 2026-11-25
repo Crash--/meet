@@ -12,8 +12,6 @@
       "stop": "Arrêter les sous-titres"
     },
     "options": {
-      "catchup": "Résumé de rattrapage",
-      "catchupHint": "À son arrivée, un participant voit un résumé de ce qu'il a manqué.",
       "summary": "Compte rendu à la fin de la réunion",
       "summaryService": "Type de compte rendu",
       "shareSummary": "Partager avec les participants",
@@ -60,6 +58,9 @@
       "etaMinutes_one": "environ {{count}} minute",
       "etaMinutes_other": "environ {{count}} minutes",
       "etaRange": "environ {{min}} à {{max}} minutes",
+      "overdue": "plus long que prévu",
+      "updating": "Mise à jour avec la suite de la réunion…",
+      "failed": "Le résumé n'a pas pu être préparé.",
       "coveredUntil": "Couvre la réunion jusqu'à {{time}}",
       "tooShort": "Trop peu de paroles avant votre arrivée pour en faire un résumé."
     }
@@ -72,9 +73,7 @@
     "summary": "Compte rendu à la fin de la réunion",
     "shareSummary": "Partager avec les participants",
     "record": "Enregistrer aussi la vidéo",
-    "noEntitlement": "La transcription après la réunion n'est pas activée pour votre compte.",
-    "catchup": "Résumé de rattrapage",
-    "catchupHint": "À son arrivée, un participant voit un résumé de ce qu'il a manqué."
+    "noEntitlement": "La transcription après la réunion n'est pas activée pour votre compte."
   },
   "banner": {
     "inProgress": "Transcription en direct"

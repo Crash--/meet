@@ -66,6 +66,43 @@ describe('catchUpView', () => {
     })
   })
 
+  it('keeps the previous brief in view while the next one is prepared', () => {
+    const view = catchUpView({
+      liveServes: false,
+      live: live({}),
+      joinedAt: null,
+      audio: audio({
+        status: 'transcribing',
+        progress: 0.3,
+        overdue: true,
+        brief: { text: 'Old', coveredUntil: JOINED },
+      }),
+    })
+    expect(view).toMatchObject({
+      phase: 'text',
+      text: 'Old',
+      coveredUntil: JOINED,
+      step: 'transcribing',
+      progress: 0.3,
+      overdue: true,
+    })
+  })
+
+  it('says when the brief could not be prepared, unless one is left', () => {
+    const failed = (brief: AudioCatchUpState['brief']) =>
+      catchUpView({
+        liveServes: false,
+        live: live({}),
+        joinedAt: null,
+        audio: audio({ status: 'failed', brief }),
+      })
+    expect(failed(null)?.phase).toBe('failed')
+    expect(failed({ text: 'Old', coveredUntil: 1 })).toMatchObject({
+      phase: 'text',
+      text: 'Old',
+    })
+  })
+
   it('waits for the first words of the live summary', () => {
     expect(
       catchUpView({
@@ -110,7 +147,6 @@ describe('catchUpView', () => {
 
   it.each([
     ['idle', audio({})],
-    ['failed', audio({ status: 'failed' })],
     ['unavailable', audio({ status: 'unavailable' })],
     ['ready without brief', audio({ status: 'ready' })],
     [

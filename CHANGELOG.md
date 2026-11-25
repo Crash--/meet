@@ -11,7 +11,9 @@ and this project adheres to
 ### Added
 
 - ✨(backend) one Studio conversation per meeting for the late joiners' brief, the transcript at the end
+- ✨(frontend) the brief's wait shows from the arrival, says when it runs late or fails, over the previous brief
 - ✨(backend) an audio recording is written as segments by its one egress while the catch-up is on
+- 🔥(frontend) no more "catch-up summary" option: a late joiner always gets the brief, live or recorded
 - ✨(backend) accept OIDC access tokens on the core API for native apps, opt-in and per client
 - ✨(frontend) "before you arrived" opens the side panel, from a live run or the recording
 - ✨(backend) late joiners' brief from the recording's audio, through Studio's standard API

@@ -14,11 +14,13 @@ export type CatchUpView = {
   source: CatchUpSource
   // The source's own status, exposed as `data-status`.
   status: string
-  phase: 'preparing' | 'text' | 'too_short'
-  // Audio only: the step being run, its progress and the time left.
+  phase: 'preparing' | 'text' | 'too_short' | 'failed'
+  // Audio only: the step being run (also while a previous brief shows), its
+  // progress and the time left.
   step: 'sending' | 'transcribing' | 'summarizing' | null
   progress: number | null
   etaS: readonly [number, number] | null
+  overdue: boolean
   text: string
   // Audio: the end of the meeting the brief covers. Live: my arrival.
   coveredUntil: number | null
@@ -37,7 +39,7 @@ export const isLateArrival = (
 
 // The audio state as a valtio snapshot hands it (deeply read-only).
 type AudioInput = Readonly<
-  Pick<AudioCatchUpState, 'status' | 'progress' | 'dismissed'>
+  Pick<AudioCatchUpState, 'status' | 'progress' | 'overdue' | 'dismissed'>
 > & {
   readonly etaS: readonly [number, number] | null
   readonly brief: Readonly<AudioCatchUpBrief> | null
@@ -47,6 +49,7 @@ const base = {
   step: null,
   progress: null,
   etaS: null,
+  overdue: false,
   text: '',
   coveredUntil: null,
   joinedAt: null,
@@ -94,23 +97,26 @@ export const catchUpView = ({
   }
   if (audio.dismissed) return null
   const view = { ...base, source: 'audio' as const, status: audio.status }
+  const brief = audio.brief
+    ? {
+        phase: 'text' as const,
+        text: audio.brief.text,
+        coveredUntil: audio.brief.coveredUntil,
+      }
+    : null
   if (AUDIO_CATCH_UP_RUNNING.includes(audio.status)) {
     return {
       ...view,
       phase: 'preparing',
+      ...brief,
       step: audio.status as CatchUpView['step'],
       progress: audio.progress,
       etaS: audio.etaS,
+      overdue: audio.overdue,
     }
   }
-  if (audio.status === 'ready' && audio.brief) {
-    return {
-      ...view,
-      phase: 'text',
-      text: audio.brief.text,
-      coveredUntil: audio.brief.coveredUntil,
-    }
-  }
+  if (audio.status === 'ready' && brief) return { ...view, ...brief }
+  if (audio.status === 'failed') return { ...view, phase: 'failed', ...brief }
   if (audio.status === 'too_short') return { ...view, phase: 'too_short' }
   return null
 }

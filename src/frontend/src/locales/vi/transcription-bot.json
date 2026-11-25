@@ -12,8 +12,6 @@
       "stop": "Tắt phụ đề"
     },
     "options": {
-      "catchup": "Tóm tắt phần đã bỏ lỡ",
-      "catchupHint": "Khi vào, người tham gia thấy tóm tắt những gì đã bỏ lỡ.",
       "summary": "Biên bản khi kết thúc cuộc họp",
       "summaryService": "Loại biên bản",
       "shareSummary": "Chia sẻ với người tham gia",

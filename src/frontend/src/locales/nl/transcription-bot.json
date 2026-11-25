@@ -12,8 +12,6 @@
       "stop": "Ondertiteling stoppen"
     },
     "options": {
-      "catchup": "Inhaalsamenvatting",
-      "catchupHint": "Wie binnenkomt, ziet een samenvatting van wat hij heeft gemist.",
       "summary": "Verslag aan het einde van de vergadering",
       "summaryService": "Soort verslag",
       "shareSummary": "Delen met de deelnemers",
