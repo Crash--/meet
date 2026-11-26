@@ -58,7 +58,7 @@ from core.services.twake_drive import (
     build_transcript_document_filename,
     build_transcript_filename,
 )
-from core.tasks._base import NotificationTask
+from core.tasks._base import LiveSummaryTask, NotificationTask
 from core.tasks._errors import TransientError, classify_external
 from core.tasks._state import (
     ensure_state,
@@ -1358,7 +1358,7 @@ def _live_audio_files(service, conversation_id, meeting, language, log_id):
     return _provide
 
 
-@task(**_RETRY_KWARGS)
+@task(**{**_RETRY_KWARGS, "base": LiveSummaryTask})
 def process_bot_live_summary(self, room_id):
     """Summarize + deliver a LinTO bot's OWN live-transcription conversation.
 
